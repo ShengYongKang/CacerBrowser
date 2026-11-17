@@ -20,7 +20,19 @@ pub struct Manifest {
     pub engine_id: String,
     pub python_version: String,
     pub python: Asset,
-    pub fonts: Asset,
+    pub fonts: Option<Asset>,
+    #[serde(default)]
+    pub font_packs: Vec<FontPack>,
+    #[serde(default)]
+    pub font_index: serde_json::Value,
+}
+#[derive(Clone, Deserialize)]
+pub struct FontPack {
+    pub id: String,
+    pub name: String,
+    pub count: u64,
+    #[serde(flatten)]
+    pub asset: Asset,
 }
 #[derive(Clone, Default, Serialize)]
 pub struct Status {
@@ -36,10 +48,10 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 
 pub fn status() -> Status { STATUS.lock().unwrap().clone() }
 pub fn cancel() { CANCEL.store(true, Ordering::Relaxed); }
-fn cancelled() -> Result<(), String> {
+pub(crate) fn cancelled() -> Result<(), String> {
     if CANCEL.load(Ordering::Relaxed) { Err("已取消，可重新尝试".into()) } else { Ok(()) }
 }
-fn progress(message: &str, downloaded: u64, total: u64) {
+pub(crate) fn progress(message: &str, downloaded: u64, total: u64) {
     let mut state = STATUS.lock().unwrap();
     state.message = message.into();
     state.downloaded = downloaded;
@@ -66,8 +78,13 @@ pub fn manifest(root: &Path) -> Result<Manifest, String> {
     let bytes = fs::read(resource_dir(root).join("manifest.json"))
         .map_err(|_| "当前构建没有运行时清单，请使用正式安装包".to_string())?;
     let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if manifest.schema != 1 || !valid_hash(&manifest.engine_id)
-        || !valid_hash(&manifest.python.sha256) || !valid_hash(&manifest.fonts.sha256) {
+    if !matches!(manifest.schema, 1 | 2) || !valid_hash(&manifest.engine_id)
+        || !valid_hash(&manifest.python.sha256)
+        || (manifest.schema == 1 && manifest.fonts.as_ref().is_none_or(|a| !valid_hash(&a.sha256)))
+        || (manifest.schema == 2 && (manifest.font_packs.is_empty()
+            || !manifest.font_packs.iter().any(|p| p.id == "base")
+            || manifest.font_packs.iter().any(|p| !valid_hash(&p.asset.sha256)
+                || p.id.is_empty() || !p.id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')))) {
         return Err("运行时清单无效".into());
     }
     Ok(manifest)
@@ -82,15 +99,22 @@ pub fn python_dir(root: &Path, manifest: &Manifest) -> PathBuf {
     cache(root).join(format!("python-{}", &manifest.python.sha256[..16]))
 }
 pub fn engine_dir(root: &Path, manifest: &Manifest) -> PathBuf {
-    cache(root).join(format!("engine-{}-{}", &manifest.engine_id[..16], &manifest.fonts.sha256[..16]))
+    if let Some(fonts) = &manifest.fonts {
+        cache(root).join(format!("engine-{}-{}", &manifest.engine_id[..16], &fonts.sha256[..16]))
+    } else {
+        let mut digest = Sha256::new();
+        for pack in &manifest.font_packs { digest.update(pack.asset.sha256.as_bytes()); }
+        cache(root).join(format!("engine-{}-{:x}", &manifest.engine_id[..16], digest.finalize()))
+    }
 }
-fn complete(directory: &Path, hash: &str) -> bool {
+pub(crate) fn complete(directory: &Path, hash: &str) -> bool {
     fs::read_to_string(directory.join(".complete")).map(|s| s == hash).unwrap_or(false)
 }
 pub fn prepared_engine(root: &Path) -> Option<PathBuf> {
     let manifest = manifest(root).ok()?;
     let directory = engine_dir(root, &manifest);
-    (complete(&directory, &manifest.fonts.sha256) && directory.join("camoufox.exe").is_file())
+    (complete(&directory, manifest.fonts.as_ref().map(|a| a.sha256.as_str()).unwrap_or(&manifest.engine_id))
+        && directory.join("camoufox.exe").is_file())
         .then_some(directory)
 }
 pub fn prepared_python(root: &Path) -> Option<PathBuf> {
@@ -124,7 +148,79 @@ fn digest_file(path: &Path) -> Result<String, String> {
     }
     Ok(format!("{:x}", digest.finalize()))
 }
-fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> Result<PathBuf, String> {
+#[derive(Clone, Default, Deserialize, Serialize)]
+pub struct DownloadSettings {
+    pub proxy: String,
+    pub mirror: String,
+}
+pub fn download_settings(root: &Path) -> DownloadSettings {
+    fs::read(cache(root).join("download-settings.json")).ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default()
+}
+pub fn save_download_settings(root: &Path, settings: &DownloadSettings) -> Result<(), String> {
+    if !settings.proxy.trim().is_empty() {
+        reqwest::Proxy::all(settings.proxy.trim()).map_err(|_| "下载代理格式无效")?;
+    }
+    if !settings.mirror.trim().is_empty() {
+        let url = reqwest::Url::parse(settings.mirror.trim()).map_err(|_| "镜像地址格式无效")?;
+        if url.scheme() != "https" || url.host_str().is_none() || url.query().is_some() || url.fragment().is_some() {
+            return Err("镜像需为 HTTPS 前缀，不含查询参数或片段".into());
+        }
+    }
+    fs::create_dir_all(cache(root)).map_err(|e| e.to_string())?;
+    fs::write(cache(root).join("download-settings.json"),
+        serde_json::to_vec(settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+pub(crate) fn windows_proxy(server: &str) -> Option<String> {
+    let value = server.split(';').find_map(|entry| entry.strip_prefix("https="))
+        .or_else(|| server.split(';').find_map(|entry| entry.strip_prefix("http=")))
+        .or_else(|| (!server.contains('=')).then_some(server))?;
+    Some(if value.contains("://") { value.to_string() } else { format!("http://{value}") })
+}
+/// Public GitHub proxies tried in order before touching GitHub directly.
+/// They are hard-coded so a download never depends on user input.
+pub(crate) const MIRRORS: [&str; 5] = [
+    "https://ghfast.top",
+    "https://gh-proxy.com",
+    "https://github.moeyy.xyz",
+    "https://ghproxy.net",
+    "https://gh.llkk.cc",
+];
+pub(crate) fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> Result<PathBuf, String> {
+    let settings = download_settings(root);
+    let proxy = if proxy.trim().is_empty() { settings.proxy } else { proxy.to_string() };
+    let system = super::system_proxy().ok()
+        .filter(|system| system["enabled"].as_bool() == Some(true))
+        .and_then(|system| system["server"].as_str().and_then(windows_proxy));
+    let mut routes: Vec<(String, String, bool, String)> = Vec::new();
+    // Mirrors first: GitHub itself is often unreachable without a proxy.
+    for mirror in MIRRORS {
+        routes.push((format!("{mirror}/{}", asset.url), String::new(), true,
+            format!("镜像 {}", mirror.trim_start_matches("https://"))));
+    }
+    if !proxy.trim().is_empty() {
+        routes.push((asset.url.clone(), proxy, false, "指定代理".into()));
+    } else if let Some(system) = system {
+        routes.push((asset.url.clone(), system, false, "系统代理".into()));
+    }
+    routes.push((asset.url.clone(), String::new(), false, "系统 / 环境代理".into()));
+    routes.push((asset.url.clone(), String::new(), true, "直连".into()));
+    let mut last_error = String::new();
+    for (url, proxy, direct, route) in routes {
+        cancelled()?;
+        let label = format!("{name} · {route}");
+        progress(&label, 0, asset.size);
+        match download_attempt(root, asset, &url, &proxy, direct, &label) {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                cancelled()?;
+                last_error = format!("{route}：{error}");
+            }
+        }
+    }
+    Err(format!("所有下载线路均失败，请检查代理或镜像。{last_error}"))
+}
+fn download_attempt(root: &Path, asset: &Asset, request_url: &str, proxy: &str, direct: bool, name: &str) -> Result<PathBuf, String> {
     let url = reqwest::Url::parse(&asset.url).map_err(|e| e.to_string())?;
     if url.scheme() != "https" || url.host_str() != Some("github.com")
         || !url.path().starts_with("/ShengYongKang/CacerBrowser/releases/download/") {
@@ -144,11 +240,12 @@ fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> Result<PathB
             .read_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(7200))
             .user_agent("Cacer-runtime");
+        if direct { builder = builder.no_proxy(); }
         if !proxy.trim().is_empty() {
             builder = builder.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| e.to_string())?);
         }
         let client = builder.build().map_err(|e| e.to_string())?;
-        let mut response = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("下载失败：{e}"))?;
+        let mut response = client.get(request_url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("下载失败：{e}"))?;
         if let Some(length) = response.content_length() {
             if length != asset.size { return Err("下载大小与清单不一致".into()); }
         }
@@ -176,7 +273,7 @@ fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> Result<PathB
     if result.is_err() { let _ = fs::remove_file(&partial); }
     result
 }
-fn extract(archive: &Path, target: &Path, limit: u64) -> Result<(), String> {
+pub(crate) fn extract(archive: &Path, target: &Path, limit: u64) -> Result<(), String> {
     let mut archive = zip::ZipArchive::new(File::open(archive).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let mut total = 0u64;
     for index in 0..archive.len() {
@@ -209,7 +306,7 @@ fn extract(archive: &Path, target: &Path, limit: u64) -> Result<(), String> {
     if total != limit { return Err("解压内容不完整".into()); }
     Ok(())
 }
-fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     fs::create_dir_all(target).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
         cancelled()?;
@@ -226,7 +323,7 @@ pub fn install(root: &Path, kind: &str, proxy: &str) -> Result<PathBuf, String> 
     let manifest = manifest(root)?;
     let (asset, target, label) = match kind {
         "python" => (&manifest.python, python_dir(root, &manifest), "正在下载 Python 与依赖"),
-        "fonts" => (&manifest.fonts, engine_dir(root, &manifest), "正在下载浏览器字体"),
+        "fonts" => (manifest.fonts.as_ref().ok_or("请选择语言字体包")?, engine_dir(root, &manifest), "正在下载浏览器字体"),
         _ => return Err("未知运行时类型".into()),
     };
     if complete(&target, &asset.sha256) { return Ok(target); }
@@ -363,6 +460,44 @@ mod tests {
         let asset = Asset { sha256: "a".repeat(64), size: 4, unpacked_size: 4,
             url: "https://example.com/payload.zip".into() };
         assert!(operation(|| download(&dir.0, &asset, "", "test")).is_err());
+    }
+    #[test]
+    fn download_settings_validate_mirrors_and_windows_proxy_lists() {
+        assert_eq!(windows_proxy("http=127.0.0.1:8080;https=127.0.0.1:8081").as_deref(),
+            Some("http://127.0.0.1:8081"));
+        assert_eq!(windows_proxy("socks5://127.0.0.1:1080").as_deref(), Some("socks5://127.0.0.1:1080"));
+        let dir = TestDir::new();
+        for mirror in ["http://example.com", "file:///payload", "https://example.com/?url="] {
+            assert!(save_download_settings(&dir.0, &DownloadSettings { mirror: mirror.into(), proxy: "".into() }).is_err());
+        }
+        let settings = DownloadSettings { proxy: "socks5://127.0.0.1:1080".into(), mirror: "https://example.com/cache".into() };
+        save_download_settings(&dir.0, &settings).unwrap();
+        assert_eq!(download_settings(&dir.0).mirror, settings.mirror);
+    }
+    #[test]
+    fn mirror_responses_still_require_the_original_digest() {
+        use std::net::TcpListener;
+        let dir = TestDir::new();
+        let asset = Asset { sha256: format!("{:x}", Sha256::digest(b"good")), size: 4, unpacked_size: 4,
+            url: "https://github.com/ShengYongKang/CacerBrowser/releases/download/v0.0.0/fonts.zip".into() };
+        for (body, accepted) in [(b"good", true), (b"evil", false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = [0u8; 4096];
+                socket.read(&mut request).unwrap();
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n").unwrap();
+                socket.write_all(body).unwrap();
+            });
+            let result = operation(|| download_attempt(&dir.0, &asset, &url, "", true, "test"));
+            worker.join().unwrap();
+            assert_eq!(result.is_ok(), accepted);
+            let downloads = cache(&dir.0).join("downloads");
+            assert!(!downloads.join(format!("{}.partial", asset.sha256)).exists());
+            if let Ok(path) = result { fs::remove_file(path).unwrap(); }
+        }
     }
     #[test]
     fn manual_commands_quote_paths() {

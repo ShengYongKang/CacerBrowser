@@ -6,6 +6,7 @@
   $env:CAMOUFOX_RUNTIME = 'C:\build\camoufox'
   ./tools/package_runtime.ps1 -PythonEmbed build/python-embed.zip -ReleaseBase 'https://github.com/ShengYongKang/CacerBrowser/releases/download/v0.1.3'
 Run with a clean dependency interpreter; use -Python to select it.
+Install the build-only dependency first: python -m pip install fonttools==4.60.1
 #>
 param(
   [Parameter(Mandatory=$true)][string]$PythonEmbed,

@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import {
   ClashConfig, CreateRequest, DataOverview, EditRequest, ExtensionItem, ExtensionSearchResult, HistoryItem, Identity, ProxyNode, ProxySource,
   cancelRuntime, installRuntime, runtimeStatus, selectPython, type RuntimeStatus,
+  checkUpdate, downloadUpdate, updateStatus, cancelUpdate, installUpdate, type UpdateInfo, type UpdateStatus,
+  downloadSettings, saveDownloadSettings, fontOverview, type FontOverview,
   clashConfigs, cloneIdentity, createIdentity, dataOverview, deleteIdentity, editIdentity, environmentCheck,
   exportAllData, exportCookies, exportPack, extImport, extInstall, extList, extRemove, extSearch, importAllData, importPack, launchHistory, launchIdentity, listIdentities, openDataDir,
-  proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, type EnvironmentCheck,
+  proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, systemProxy, type EnvironmentCheck,
 } from "./api";
 import Flag from "./Flag";
 
@@ -26,9 +29,9 @@ const COUNTRY_OPTIONS = [
 const OS_LABELS: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux" };
 const OS_ICONS: Record<string, string> = { windows: "▣", macos: "●", linux: "◆" };
 
-type View = "overview" | "environments" | "proxy" | "extensions" | "history";
+type View = "overview" | "environments" | "proxy" | "extensions" | "history" | "fonts";
 const VIEW_LABEL: Record<View, string> = {
-  overview: "总览", environments: "浏览器环境", proxy: "代理管理", extensions: "扩展中心", history: "启动记录",
+  overview: "总览", environments: "浏览器环境", proxy: "代理管理", extensions: "扩展中心", history: "启动记录", fonts: "字体库",
 };
 const EVENT_LABEL: Record<string, string> = { launch: "启动", stop: "停止", closed: "关闭窗口" };
 const EXT_SOURCE_LABEL: Record<string, string> = { engine: "引擎内置", amo: "官方商店", local: "本地导入" };
@@ -36,6 +39,19 @@ const EXT_SOURCE_LABEL: Record<string, string> = { engine: "引擎内置", amo: 
 function formatUsers(count: number): string {
   if (count >= 10000) return `${(count / 10000).toFixed(count >= 100000 ? 0 : 1)} 万`;
   return String(count);
+}
+
+/// Sentinel shared with the Rust downloaders: every mirror and GitHub failed.
+const DOWNLOAD_ROUTES_FAILED = "所有下载线路均失败";
+
+/// Windows reports proxies as "http=host:port;https=host:port"; turn that
+/// into a single URL the download settings accept.
+function proxyFromSystem(server: string): string {
+  const entries = server.split(";").map((entry) => entry.trim()).filter(Boolean);
+  const pick = entries.find((entry) => entry.startsWith("https=")) ?? entries.find((entry) => entry.startsWith("http="));
+  const value = (pick ? pick.slice(pick.indexOf("=") + 1) : server).trim();
+  if (!value) return "";
+  return value.includes("://") ? value : `http://${value}`;
 }
 
 function formatSize(bytes: number): string {
@@ -77,6 +93,16 @@ function Modal(props: { title: string; onClose: () => void; children: ReactNode 
 
 function Icon({ children }: { children: ReactNode }) { return <span className="nav-icon">{children}</span>; }
 
+/// Every environment check on its own line; passed checks turn green.
+function EnvChecks({ checks }: { checks: EnvironmentCheck["checks"] }) {
+  return <div className="env-checks">{checks.map((check) => (
+    <div className={`env-check ${check.ok ? "ok" : "bad"}`} key={check.key}>
+      <span className="env-mark">{check.ok ? "✓" : "!"}</span>
+      <span className="env-text"><strong>{check.label}</strong>{check.detail ? `：${check.detail}` : ""}</span>
+    </div>
+  ))}</div>;
+}
+
 export default function App() {
   const [identities, setIdentities] = useState<Identity[]>([]);
   const [environment, setEnvironment] = useState<EnvironmentCheck | null>(null);
@@ -98,7 +124,22 @@ export default function App() {
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const runtimeBusyRef = useRef(false);
   const [downloadState, setDownloadState] = useState<RuntimeStatus | null>(null);
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [showUpdate, setShowUpdate] = useState(false);
+  const [updateState, setUpdateState] = useState<UpdateStatus | null>(null);
+  const updateBusy = useRef(false);
+  const [appVersion, setAppVersion] = useState("0.1.0");
   const [downloadProxy, setDownloadProxy] = useState("");
+  const [showProxy, setShowProxy] = useState(false);
+  const [proxyValue, setProxyValue] = useState("");
+  const proxyRetry = useRef<((proxy: string) => void) | null>(null);
+  const [fontPlan, setFontPlan] = useState<FontOverview | null>(null);
+  const [fontCountry, setFontCountry] = useState("");
+  const [fontIdentity, setFontIdentity] = useState("");
+  const [selectedFonts, setSelectedFonts] = useState<string[]>([]);
+  const [fontLoading, setFontLoading] = useState(false);
+  const fontRequest = useRef(0);
+  const [pendingLaunch, setPendingLaunch] = useState<string | null>(null);
   const [pythonPath, setPythonPath] = useState("");
   const environmentRef = useRef<EnvironmentCheck | null>(null);
   const [copied, setCopied] = useState(false);
@@ -129,7 +170,15 @@ export default function App() {
 
   useEffect(() => {
     checkEnvironment();
+    downloadSettings().then((settings) => setDownloadProxy(settings.proxy))
+      .catch((e) => setError(String(e)));
+    // Startup update probe: a failed check must never disturb the workflow.
+    checkUpdate().then((info) => { if (info.available) setUpdate(info); }).catch(() => {});
+    getVersion().then(setAppVersion).catch(() => {});
   }, []);
+  useEffect(() => {
+    if (view === "fonts") loadFontPlan();
+  }, [view, fontCountry, fontIdentity]);
   useEffect(() => {
     const timer = setInterval(() => {
       if (!document.hidden) refresh();
@@ -182,25 +231,113 @@ export default function App() {
       return result;
     } catch (e) { setError(String(e)); return null; }
   }
-  async function setupRuntime(kind: "python" | "fonts"): Promise<boolean> {
+  /// Every built-in mirror failed: ask for a proxy, prefilled with the system
+  /// one, and retry the failed download once it is saved.
+  async function offerProxy(retry: (proxy: string) => void) {
+    proxyRetry.current = retry;
+    let value = downloadProxy.trim();
+    if (!value) {
+      try {
+        const system = await systemProxy();
+        if (system.enabled) value = proxyFromSystem(system.server);
+      } catch { /* keep empty; the user can type one */ }
+    }
+    setProxyValue(value);
+    setShowProxy(true);
+  }
+  async function applyProxy() {
+    const proxy = proxyValue.trim();
+    if (!proxy) return;
+    try {
+      await saveDownloadSettings({ proxy, mirror: "" });
+      setDownloadProxy(proxy);
+      setShowProxy(false);
+      setError(null);
+      const retry = proxyRetry.current;
+      proxyRetry.current = null;
+      retry?.(proxy);
+    } catch (e) { setError(String(e)); }
+  }
+  async function setupRuntime(kind: "python" | "fonts", fontIds: string[] = [], proxyOverride?: string): Promise<boolean> {
     if (runtimeBusyRef.current) return false;
     runtimeBusyRef.current = true;
     setRuntimeBusy(true);
     setError(null);
     setDownloadState({ busy: true, message: "正在准备", downloaded: 0, total: 0 });
     const timer = window.setInterval(() => runtimeStatus().then(setDownloadState).catch(() => {}), 500);
+    const proxy = proxyOverride ?? downloadProxy;
     try {
-      await installRuntime(kind, downloadProxy);
+      await saveDownloadSettings({ proxy, mirror: "" });
+      await installRuntime(kind, proxy, fontIds);
+      if (kind === "fonts") await loadFontPlan();
       await checkEnvironment();
       setNotice(kind === "python" ? "Python 与依赖已准备完成" : "浏览器字体已准备完成，后续可离线使用");
       return true;
-    } catch (e) { setError(String(e)); return false; }
+    } catch (e) {
+      const message = String(e);
+      if (message.includes(DOWNLOAD_ROUTES_FAILED)) {
+        void offerProxy((retryProxy) => { void setupRuntime(kind, fontIds, retryProxy); });
+      } else setError(message);
+      return false;
+    }
     finally {
       window.clearInterval(timer);
       runtimeBusyRef.current = false;
       setRuntimeBusy(false);
       setDownloadState(null);
     }
+  }
+  async function startUpdate() {
+    if (updateBusy.current || !update) return;
+    updateBusy.current = true;
+    setError(null);
+    setUpdateState({ busy: true, message: "正在准备下载", downloaded: 0, total: update.size });
+    const timer = window.setInterval(() => updateStatus().then(setUpdateState).catch(() => {}), 500);
+    let launched = false;
+    try {
+      await downloadUpdate();
+      window.clearInterval(timer);
+      setUpdateState({ busy: false, message: "下载完成，正在启动安装程序…", downloaded: update.size, total: update.size });
+      launched = true;
+      await installUpdate();
+      setNotice("安装程序已启动，Cacer 即将退出完成更新");
+    } catch (e) {
+      // Once the installer starts the window closes, so the call may reject
+      // without meaning the update failed.
+      const message = String(e);
+      if (launched) return;
+      if (message.includes(DOWNLOAD_ROUTES_FAILED)) {
+        void offerProxy(() => { void startUpdate(); });
+      } else setError(message);
+    } finally {
+      window.clearInterval(timer);
+      updateBusy.current = false;
+      setUpdateState(null);
+    }
+  }
+  async function loadFontPlan() {
+    const request = ++fontRequest.current;
+    setFontLoading(true);
+    try {
+      const plan = await fontOverview(fontIdentity, fontCountry);
+      if (request !== fontRequest.current) return;
+      setFontPlan(plan);
+      setSelectedFonts(plan.packs.filter((pack) => pack.required && !pack.cached).map((pack) => pack.id));
+    } catch (e) { if (request === fontRequest.current) { setFontPlan(null); setError(String(e)); } }
+    finally { if (request === fontRequest.current) setFontLoading(false); }
+  }
+  async function downloadAndLaunch() {
+    if (!pendingLaunch || !fontPlan || fontLoading) return;
+    const id = pendingLaunch;
+    if (await setupRuntime("fonts", fontPlan.packs.filter((pack) => pack.required).map((pack) => pack.id))) {
+      await launchIdentity(id); setPendingLaunch(null); setView("environments");
+    }
+  }
+  async function saveDownloadOptions() {
+    try {
+      await saveDownloadSettings({ proxy: downloadProxy, mirror: "" });
+      setNotice("下载设置已保存");
+    } catch (e) { setError(String(e)); }
   }
   async function applyPython() {
     if (runtimeBusyRef.current) return;
@@ -212,15 +349,19 @@ export default function App() {
   }
   async function launchPrepared(id: string) {
     if (!environmentRef.current?.ready) { setGuide("python"); return; }
-    if (!environmentRef.current.fonts_ready) {
-      setGuide("fonts");
-      if (!(await setupRuntime("fonts"))) return;
-      setGuide(null);
+    const plan = await fontOverview(id);
+    if (!plan.ready) {
+      setFontIdentity(id); setFontCountry(""); setFontPlan(plan);
+      setSelectedFonts(plan.packs.filter((pack) => pack.required && !pack.cached).map((pack) => pack.id));
+      setPendingLaunch(id); setView("fonts");
+      setNotice("该环境缺少字体，请核对下方下载计划后选择「下载所需并启动」。");
+      return;
     }
     await launchIdentity(id);
   }
   const failedKeys = environment?.checks.filter((check) => !check.ok).map((check) => check.key) ?? [];
   const pythonMissing = failedKeys.includes("python");
+  const depsMissing = failedKeys.includes("dependencies");
   const engineMissing = failedKeys.includes("engine");
   const guideText = environment?.manual_commands ?? "正在读取安装命令…";
   function openGuide(kind: "python" | "engine" | "fonts") { setCopied(false); setGuide(kind); }
@@ -626,11 +767,15 @@ export default function App() {
 
   const runtimeControls = <section className="edit-section">
     <h4>运行环境</h4>
-    <p className="hint">Python 可快捷下载到应用专用目录，也可手动安装后指定解释器。浏览器字体首次启动时下载，所有环境共用缓存。</p>
-    <label className="edit-field"><span>下载代理（可选）</span><input value={downloadProxy} onChange={(e) => setDownloadProxy(e.target.value)} placeholder="http://127.0.0.1:7890" disabled={runtimeBusy} /></label>
+    <p className="hint">Python 可快捷安装或手动配置。字体按环境语言、界面语言及实际字体需求下载，所有环境共享缓存。</p>
+    {environment && <EnvChecks checks={environment.checks} />}
+    <p className="hint">下载会依次尝试多个公开的 GitHub 镜像，全部不可用时再提示配置代理；镜像文件仍须通过内置 SHA256 校验。</p>
+    <label className="edit-field"><span>指定下载代理（留空自动检测系统代理）</span><input value={downloadProxy} onChange={(e) => setDownloadProxy(e.target.value)} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" disabled={runtimeBusy} /></label>
+    <p className="field-hint">代理只用于下载安装资源，不修改环境的浏览代理。</p>
+    <button className="secondary" onClick={saveDownloadOptions} disabled={runtimeBusy}>保存下载设置</button>
     <div className="settings-actions">
       <button className="primary" disabled={runtimeBusy} onClick={() => setupRuntime("python")}>快捷安装 Python 与依赖{environment?.python_size ? `（${formatSize(environment.python_size)}）` : ""}</button>
-      <button className="secondary" disabled={runtimeBusy || environment?.fonts_ready} onClick={() => setupRuntime("fonts")}>{environment?.fonts_ready ? "字体已就绪" : `下载字体${environment?.fonts_size ? `（${formatSize(environment.fonts_size)}）` : ""}`}</button>
+      <button className="secondary" onClick={() => { setShowSettings(false); setGuide(null); setView("fonts"); }}>管理字体库</button>
       <button className="secondary" disabled={runtimeBusy} onClick={checkEnvironment}>重新检查</button>
     </div>
     {downloadState && <div className="form-progress" role="status">{downloadState.message}{downloadState.total > 0 && <> · {formatSize(downloadState.downloaded)} / {formatSize(downloadState.total)}<progress max={downloadState.total} value={downloadState.downloaded} /></>}<button className="secondary" onClick={() => cancelRuntime().catch((e) => setError(String(e)))}>取消</button></div>}
@@ -646,15 +791,42 @@ export default function App() {
   return <main className="app-shell">
     <aside className="sidebar">
       <div className="brand"><img className="brand-mark" src={APP_ICON} alt="" /><div><strong>Cacer</strong><span>隐私浏览工作台</span></div></div>
-      <nav className="nav"><div className="nav-group-title">工作台</div><a className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Icon>⌂</Icon>总览</a><a className={`nav-item ${view === "environments" ? "active" : ""}`} onClick={() => setView("environments")}><Icon>▦</Icon>浏览器环境<span className="nav-count">{identities.length}</span></a><a className={`nav-item ${view === "proxy" ? "active" : ""}`} onClick={() => setView("proxy")}><Icon>⌁</Icon>代理管理</a><a className={`nav-item ${view === "extensions" ? "active" : ""}`} onClick={() => setView("extensions")}><Icon>⧩</Icon>扩展中心<span className="nav-count">{extItems.length}</span></a><a className={`nav-item ${view === "history" ? "active" : ""}`} onClick={() => setView("history")}><Icon>◷</Icon>启动记录</a><div className="nav-group-title second">系统</div><a className="nav-item" onClick={openSettings}><Icon>⚙</Icon>设置</a></nav>
-      <div className={`sidebar-bottom ${environment && !environment.ready ? "service-warning" : ""}`} onClick={checkEnvironment} title="点击重新检查运行环境"><div className="health-dot"/><div><strong>{environment ? (environment.ready ? "本地服务正常" : "需要检查环境") : "正在检查环境"}</strong><span>Cacer 0.1.0 · 点击检测</span></div></div>
+      <nav className="nav"><div className="nav-group-title">工作台</div><a className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Icon>⌂</Icon>总览</a><a className={`nav-item ${view === "environments" ? "active" : ""}`} onClick={() => setView("environments")}><Icon>▦</Icon>浏览器环境<span className="nav-count">{identities.length}</span></a><a className={`nav-item ${view === "proxy" ? "active" : ""}`} onClick={() => setView("proxy")}><Icon>⌁</Icon>代理管理</a><a className={`nav-item ${view === "extensions" ? "active" : ""}`} onClick={() => setView("extensions")}><Icon>⧩</Icon>扩展中心<span className="nav-count">{extItems.length}</span></a><a className={`nav-item ${view === "history" ? "active" : ""}`} onClick={() => setView("history")}><Icon>◷</Icon>启动记录</a><div className="nav-group-title second">系统</div><a className={`nav-item ${view === "fonts" ? "active" : ""}`} onClick={() => setView("fonts")}><Icon>文</Icon>字体库</a><a className="nav-item" onClick={openSettings}><Icon>⚙</Icon>设置</a></nav>
+      <div className={`sidebar-bottom ${environment && !environment.ready ? "service-warning" : ""}`} onClick={checkEnvironment} title="点击重新检查运行环境"><div className="health-dot"/><div><strong>{environment ? (environment.ready ? "本地服务正常" : "需要检查环境") : "正在检查环境"}</strong><span>Cacer {appVersion} · 点击检测</span></div></div>
     </aside>
     <section className="workspace">
-      <header className="topbar"><div className="breadcrumb"><span>工作台</span><b>/</b><strong>{VIEW_LABEL[view]}</strong></div><div className="top-actions"><button className="icon-button" title="刷新" onClick={() => refresh(true)}>↻</button><button className="icon-button" title="设置" onClick={openSettings}>⚙</button></div></header>
+      <header className="topbar"><div className="breadcrumb"><span>工作台</span><b>/</b><strong>{VIEW_LABEL[view]}</strong></div><div className="top-actions">{update?.available && <button className="icon-button update-button" title={`发现新版本 ${update.latest}`} onClick={() => setShowUpdate(true)}>⤓<i className="update-dot" /></button>}<button className="icon-button" title="刷新" onClick={() => refresh(true)}>↻</button><button className="icon-button" title="设置" onClick={openSettings}>⚙</button></div></header>
       <div className="content">
-        {environment && !environment.ready && <div className="banner warning"><span>!</span><div><strong>运行环境未就绪</strong><p>{environment.checks.filter((check) => !check.ok).map((check) => `${check.label}：${check.detail}`).join("；")}</p></div><div className="banner-actions">{pythonMissing && <button onClick={() => openGuide("python")}>安装 Python</button>}{engineMissing && <button onClick={() => openGuide("engine")}>安装 Camoufox 引擎</button>}<button onClick={checkEnvironment}>重新检查</button></div></div>}
+        {environment && !environment.ready && <div className="banner warning"><span>!</span><div><strong>运行环境未就绪</strong><EnvChecks checks={environment.checks} /></div><div className="banner-actions">{pythonMissing && <button onClick={() => openGuide("python")}>安装 Python</button>}{depsMissing && <button onClick={() => openGuide("python")}>安装运行依赖</button>}{engineMissing && <button onClick={() => openGuide("engine")}>安装 Camoufox 引擎</button>}<button onClick={checkEnvironment}>重新检查</button></div></div>}
         {error && <div className="banner error"><span>!</span><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
         {notice && <div className="banner success"><span>✓</span><span>{notice}</span></div>}
+        {view === "fonts" && <>
+          <div className="page-heading"><div><div className="eyebrow">FONT LIBRARY</div><h1>字体库</h1><p>按环境准备所需字体，已下载的字体可在所有环境中复用。</p></div><button className="secondary" onClick={loadFontPlan} disabled={runtimeBusy || fontLoading}>刷新索引</button></div>
+          <section className="panel font-panel">
+            <div className="grid">
+              <label><span>按环境检查</span><select value={fontIdentity} disabled={runtimeBusy} onChange={(e) => { setFontPlan(null); setFontIdentity(e.target.value); setFontCountry(""); setPendingLaunch(null); }}><option value="">选择环境…</option>{identities.map((it) => <option key={it.id} value={it.id}>{it.name || it.id} · {it.country} · {OS_LABELS[it.os] ?? it.os}</option>)}</select></label>
+              <label><span>按国家 / 地区预下载</span><select value={fontCountry} disabled={runtimeBusy} onChange={(e) => { setFontPlan(null); setFontCountry(e.target.value); setFontIdentity(""); setPendingLaunch(null); }}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{value ? label : "仅公共字体"}</option>)}</select></label>
+            </div>
+            <p className="hint">国家对应的语言只是推荐。选择已有环境后，还会检查浏览器界面语言和系统指纹实际需要的字体；英语环境也可能需要中日韩字体。预下载后，启动前会再检查一次。</p>
+            {fontLoading && <div className="form-progress">正在读取环境的字体需求…</div>}
+            {fontPlan?.development && <p className="hint">当前开发环境使用已安装引擎的字体。正式安装包提供分包索引与下载管理。</p>}
+            {fontPlan && !fontPlan.development && <>
+              <div className="font-summary"><strong>{fontPlan.packs.filter((pack) => pack.cached).length} / {fontPlan.packs.length} 个包已缓存</strong><span>当前缺少 {fontPlan.packs.filter((pack) => pack.required && !pack.cached).length} 个所需包 · 需下载 {formatSize(fontPlan.missing_size)}</span></div>
+              <div className="settings-actions">
+                <button className="primary" disabled={runtimeBusy || fontLoading || fontPlan.ready} onClick={() => setupRuntime("fonts", fontPlan.packs.filter((pack) => pack.required).map((pack) => pack.id))}>下载当前所需</button>
+                <button className="secondary" disabled={runtimeBusy || fontLoading || !selectedFonts.length} onClick={() => setupRuntime("fonts", selectedFonts)}>下载勾选项</button>
+                <button className="secondary" disabled={runtimeBusy || fontLoading || fontPlan.packs.every((pack) => pack.cached)} onClick={() => setupRuntime("fonts", fontPlan.packs.map((pack) => pack.id))}>全部下载（{formatSize(fontPlan.packs.filter((pack) => !pack.cached).reduce((sum, pack) => sum + pack.size, 0))}）</button>
+                {pendingLaunch && <button className="primary" disabled={runtimeBusy || fontLoading || !fontIdentity} onClick={() => withBusy("font-launch", downloadAndLaunch)}>{fontPlan.ready ? "启动环境" : "下载所需并启动"}</button>}
+              </div>
+              <div className="sub-list">{fontPlan.packs.map((pack) => <label className="sub-row font-row" key={pack.id}>
+                <input type="checkbox" checked={selectedFonts.includes(pack.id)} disabled={pack.cached || runtimeBusy || fontLoading} onChange={(e) => setSelectedFonts(e.target.checked ? [...selectedFonts, pack.id] : selectedFonts.filter((id) => id !== pack.id))} />
+                <div className="sub-info"><strong>{pack.name}</strong><span>{pack.count ? `${pack.count} 个文件 · ` : ""}{formatSize(pack.size)} 下载 · {formatSize(pack.unpacked_size)} 解压</span></div>
+                <span className={pack.cached ? "font-cached" : "font-missing"}>{pack.cached ? "已缓存" : pack.required ? "当前需要" : "可选"}</span>
+              </label>)}</div>
+            </>}
+          </section>
+          <section className="panel font-panel">{runtimeControls}</section>
+        </>}
         {view === "overview" && <>
           <div className="page-heading"><div><div className="eyebrow">DASHBOARD</div><h1>总览</h1><p>查看运行状态与环境分布。</p></div><button className="primary large" onClick={openCreate}>＋ 新建环境</button></div>
           <section className="stats"><div className="stat-card"><span className="stat-icon purple">▦</span><div><span>全部环境</span><strong>{identities.length}</strong></div></div><div className="stat-card"><span className="stat-icon green">●</span><div><span>正在运行</span><strong>{running}</strong></div></div><div className="stat-card"><span className="stat-icon blue">⌁</span><div><span>已配置代理</span><strong>{proxyCount}</strong></div></div><div className="stat-card"><span className="stat-icon orange">✓</span><div><span>服务状态</span><strong className="status-text">{environment?.ready ? "正常" : "待检查"}</strong></div></div></section>
@@ -747,6 +919,32 @@ export default function App() {
       {error && <div className="form-error">{error}</div>}
       {runtimeControls}
       <section className="edit-section">{dataBlock}</section>
+    </Modal>}
+    {showUpdate && update && <Modal title="发现新版本" onClose={() => { if (!updateState?.busy) setShowUpdate(false); }}>
+      {error && <div className="form-error">{error}</div>}
+      <section className="edit-section">
+        <div className="update-versions"><span>当前版本 <strong>{update.current}</strong></span><span>最新版本 <strong>{update.latest}</strong></span><span>安装包 {formatSize(update.size)}</span></div>
+        {update.notes && <pre className="update-notes">{update.notes}</pre>}
+        <p className="hint">下载会自动尝试多个中国大陆可用的 GitHub 镜像，任一线路成功即开始安装。安装向导中可修改安装目录，现有环境、订阅与设置都会保留。</p>
+        {updateState && <div className="form-progress" role="status">{updateState.message}{updateState.total > 0 && <> · {formatSize(updateState.downloaded)} / {formatSize(updateState.total)}<progress max={updateState.total} value={updateState.downloaded} /></>}</div>}
+      </section>
+      <div className="modal-footer">
+        {updateState?.busy
+          ? <button className="secondary" onClick={() => cancelUpdate().catch((e) => setError(String(e)))}>取消下载</button>
+          : <><button className="secondary" onClick={() => setShowUpdate(false)}>稍后</button><button className="primary" onClick={startUpdate}>下载并安装</button></>}
+      </div>
+    </Modal>}
+    {showProxy && <Modal title="下载线路不可用" onClose={() => setShowProxy(false)}>
+      {error && <div className="form-error">{error}</div>}
+      <section className="edit-section">
+        <p className="hint">已依次尝试所有内置 GitHub 镜像，仍无法下载。请填写一个可用的 HTTP / SOCKS5 代理后重试；下方已自动填入系统代理。</p>
+        <label className="edit-field"><span>下载代理</span><input value={proxyValue} onChange={(e) => setProxyValue(e.target.value)} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
+        <p className="field-hint">代理只用于下载安装资源，不修改环境的浏览代理。</p>
+      </section>
+      <div className="modal-footer">
+        <button className="secondary" onClick={() => setShowProxy(false)}>取消</button>
+        <button className="primary" disabled={!proxyValue.trim()} onClick={applyProxy}>保存并重试</button>
+      </div>
     </Modal>}
     {showClash && <Modal title="扫描到的 Clash 配置" onClose={() => setShowClash(false)}>
       {error && <div className="form-error">{error}</div>}

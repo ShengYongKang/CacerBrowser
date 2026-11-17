@@ -1,4 +1,6 @@
 mod runtime;
+mod fonts;
+mod update;
 
 use serde_json::Value;
 use std::io::Read;
@@ -55,8 +57,145 @@ fn probe_python(program: &str, version_flag: Option<&str>) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Interpreters known to the `py` launcher, newest first. Parsing its listing
+/// finds installs that are absent from this process's PATH, which happens when
+/// Python is installed after the GUI inherited its environment.
+fn launcher_paths(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| {
+            // " -V:3.14[-64] *   C:\Program Files\Python314\python.exe"
+            let tail = line
+                .rsplit(']')
+                .next()
+                .unwrap_or(line)
+                .trim_start_matches(|c: char| c == '*' || c.is_whitespace());
+            if tail.to_ascii_lowercase().ends_with("python.exe") {
+                Some(PathBuf::from(tail))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn launcher_python() -> Option<PathBuf> {
+    let output = silent_command("py").arg("-0p").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    launcher_paths(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+/// `HKEY_*\SOFTWARE\Python\PythonCore\<version>\InstallPath` records every
+/// python.org install. Reading it covers interpreters installed without the
+/// launcher or without a PATH entry.
+fn registry_paths(text: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut in_install_path = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("HKEY_") {
+            in_install_path = line.ends_with("\\InstallPath");
+            continue;
+        }
+        if !in_install_path {
+            continue;
+        }
+        let Some((name, value)) = line.split_once("REG_SZ") else { continue };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("ExecutablePath") {
+            paths.push(PathBuf::from(value));
+        } else if name == "(Default)" {
+            paths.push(PathBuf::from(value).join("python.exe"));
+        }
+    }
+    paths
+}
+
+fn registry_python() -> Option<PathBuf> {
+    for hive in ["HKCU", "HKLM"] {
+        for key in [
+            "SOFTWARE\\Python\\PythonCore",
+            "SOFTWARE\\WOW6432Node\\Python\\PythonCore",
+        ] {
+            let output = match silent_command("reg")
+                .args(["query", &format!("{hive}\\{key}"), "/s"])
+                .output()
+            {
+                Ok(output) if output.status.success() => output,
+                _ => continue,
+            };
+            if let Some(path) = registry_paths(&String::from_utf8_lossy(&output.stdout))
+                .into_iter()
+                .find(|path| path.is_file())
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Standard installer locations, newest first, as the last resort for machines
+/// that have neither the launcher nor registry entries available.
+fn installed_python_dirs() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(&local).join("Programs").join("Python"));
+        roots.push(PathBuf::from(local).join("Python"));
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(base) = std::env::var(variable) {
+            roots.push(PathBuf::from(base));
+        }
+    }
+    roots.push(PathBuf::from("C:\\"));
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !(name.starts_with("python3") || name.starts_with("pythoncore-3")) {
+                continue;
+            }
+            let executable = entry.path().join("python.exe");
+            if executable.is_file() {
+                found.push(executable);
+            }
+        }
+    }
+    found.sort_by_key(|path| {
+        std::cmp::Reverse(std::fs::metadata(path).and_then(|data| data.modified()).ok())
+    });
+    found
+}
+
 fn system_python() -> Option<PathBuf> {
-    probe_python("py", Some("-3")).or_else(|| probe_python("python", None))
+    probe_python("py", Some("-3"))
+        .or_else(|| probe_python("python", None))
+        .or_else(|| probe_python("python3", None))
+        .or_else(|| probe_python("py", None))
+        .or_else(launcher_python)
+        .or_else(registry_python)
+        .or_else(|| installed_python_dirs().into_iter().next())
+}
+
+/// Printed in the environment check so a detected interpreter is visible even
+/// when its dependencies are missing.
+fn python_version(python: &PathBuf) -> Option<String> {
+    let output = silent_command(python)
+        .args(["-c", "import sys;print(sys.version.split()[0])"])
+        .output()
+        .ok()?;
+    output.status.success().then(|| {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    })
 }
 
 /// A bundled runtime or project venv wins because it can carry camoufox;
@@ -68,7 +207,11 @@ fn python_path(root: &PathBuf) -> PathBuf {
     }
     static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     if let Some(path) = CACHE.get() {
-        return path.clone();
+        // A cached interpreter can disappear (uninstalled or upgraded in
+        // another folder); re-detect instead of reporting a stale path.
+        if path.is_file() {
+            return path.clone();
+        }
     }
     let resolved = bundled_python(root)
         .or_else(system_python)
@@ -332,6 +475,7 @@ fn environment_check_sync() -> Result<Value, String> {
     let cli = cli_path(&root);
     let profiles = data_root.join("profiles");
     let python_ok = python.is_file();
+    let detected_version = python_ok.then(|| python_version(&python)).flatten();
     let cli_ok = cli.is_file();
     let profiles_ok = profiles.is_dir() || std::fs::create_dir_all(&profiles).is_ok();
     let camoufox_exe = find_engine(&root);
@@ -348,9 +492,28 @@ fn environment_check_sync() -> Result<Value, String> {
     let checks = vec![
         serde_json::json!({
             "key": "python",
-            "label": "Python 运行时",
-            "ok": python_ok && camoufox_import_ok,
-            "detail": if camoufox_import_ok { python.display().to_string() } else { "Python 或运行依赖未就绪，可快捷安装或手动配置".to_string() }
+            "label": "Python 解释器",
+            "ok": python_ok,
+            "detail": if python_ok {
+                match &detected_version {
+                    Some(version) => format!("Python {version} · {}", python.display()),
+                    None => python.display().to_string(),
+                }
+            } else {
+                "未检测到可用的 Python 解释器".to_string()
+            }
+        }),
+        serde_json::json!({
+            "key": "dependencies",
+            "label": "运行依赖",
+            "ok": camoufox_import_ok,
+            "detail": if camoufox_import_ok {
+                "camoufox、playwright 等依赖已就绪".to_string()
+            } else if python_ok {
+                "已检测到 Python，但缺少 camoufox / playwright 等依赖。可为其安装依赖，或使用「快捷安装」的独立运行时".to_string()
+            } else {
+                "需要先检测到 Python 解释器".to_string()
+            }
         }),
         serde_json::json!({
             "key": "cli",
@@ -381,9 +544,10 @@ fn environment_check_sync() -> Result<Value, String> {
         "root": root.display().to_string(),
         "data_root": data_root.display().to_string(),
         "dependencies_ready": camoufox_import_ok,
-        "fonts_ready": manifest.is_none() || runtime::prepared_engine(&root).is_some(),
+        "fonts_ready": fonts::overview(&root, &serde_json::json!({}))?["ready"],
         "python_size": manifest.as_ref().map(|m| m.python.size),
-        "fonts_size": manifest.as_ref().map(|m| m.fonts.size),
+        "fonts_size": manifest.as_ref().map(|m| m.fonts.as_ref().map(|a| a.size)
+            .unwrap_or_else(|| m.font_packs.iter().map(|p| p.asset.size).sum())),
         "manual_commands": runtime::guide(&root).unwrap_or_else(|_| "开发环境：python -m pip install -r requirements-runtime.txt".into()),
         "checks": checks
     }))
@@ -396,17 +560,46 @@ fn runtime_status() -> runtime::Status { runtime::status() }
 fn cancel_runtime() { runtime::cancel(); }
 
 #[tauri::command]
-async fn install_runtime(kind: String, proxy: String) -> Result<Value, String> {
+async fn install_runtime(kind: String, proxy: String, font_ids: Option<Vec<String>>) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         runtime::operation(|| {
             let root = project_root();
-            let path = runtime::install(&root, &kind, &proxy)?;
+            let path = if kind == "fonts" {
+                fonts::install(&root, &font_ids.unwrap_or_default(), &proxy)?
+            } else { runtime::install(&root, &kind, &proxy)? };
             if kind == "python" {
                 runtime::select_python(&root, &path.join("python.exe").to_string_lossy())?;
             }
             Ok(serde_json::json!({ "path": path }))
         })
     }).await.map_err(|e| e.to_string())?
+}
+
+fn font_overview_sync(identity_id: Option<&str>, country: Option<&str>) -> Result<Value, String> {
+    let root = project_root();
+    if runtime::manifest(&root).is_err() { return fonts::overview(&root, &Value::Null); }
+    let request = if let Some(id) = identity_id {
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err("无效环境 ID".into());
+        }
+        run_cli(&["font-requirements", id])?
+    } else {
+        serde_json::json!({"country": country, "ui_locale": if country.is_some() { "zh-CN" } else { "" }})
+    };
+    fonts::overview(&root, &request)
+}
+#[tauri::command]
+async fn font_overview(identity_id: Option<String>, country: Option<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move ||
+        font_overview_sync(identity_id.as_deref(), country.as_deref())
+    ).await.map_err(|e| e.to_string())?
+}
+#[tauri::command]
+fn download_settings() -> runtime::DownloadSettings { runtime::download_settings(&project_root()) }
+
+#[tauri::command]
+fn save_download_settings(settings: runtime::DownloadSettings) -> Result<(), String> {
+    runtime::save_download_settings(&project_root(), &settings)
 }
 
 #[tauri::command]
@@ -618,9 +811,12 @@ async fn delete_identity(id: String, purge: bool) -> Result<Value, String> {
 
 #[tauri::command]
 async fn launch_identity(id: String) -> Result<Value, String> {
-    let root = project_root();
-    if runtime::manifest(&root).is_ok() && runtime::prepared_engine(&root).is_none() {
-        return Err("请先下载浏览器字体".into());
+    let check_id = id.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move ||
+        font_overview_sync(Some(&check_id), None)
+    ).await.map_err(|e| e.to_string())??;
+    if plan["ready"] != true {
+        return Err("该环境需要的字体尚未下载，请在字体库中准备后再启动".into());
     }
     // The Python CLI supervises the detached browser helper. Returning after
     // the helper publishes `starting` keeps the Tauri UI responsive; the
@@ -917,6 +1113,39 @@ async fn launch_history(limit: usize) -> Result<Value, String> {
     run_cli_task(vec!["history".into(), "--limit".into(), limit]).await
 }
 
+// ------------------------------------------------------------ self update
+
+/// Async: the GitHub API (and its mirrors) is a network call.
+#[tauri::command]
+async fn check_update() -> Result<update::UpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(update::check)
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn download_update() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| update::download(&project_root()))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn update_status() -> update::Status { update::status() }
+
+#[tauri::command]
+fn cancel_update() { update::cancel(); }
+
+/// Start the downloaded installer (which keeps the directory page editable)
+/// and close the running app so the installer can replace its files.
+#[tauri::command]
+fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    update::install(&project_root())?;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        app.exit(0);
+    });
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -924,6 +1153,9 @@ pub fn run() {
             list_identities,
             environment_check,
             runtime_status,
+            font_overview,
+            download_settings,
+            save_download_settings,
             cancel_runtime,
             install_runtime,
             select_python,
@@ -956,7 +1188,52 @@ pub fn run() {
             import_all_data,
             open_data_dir,
             launch_history,
+            check_update,
+            download_update,
+            update_status,
+            cancel_update,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_listing_preserves_paths_with_spaces() {
+        let listing = " -V:3.14[-64] *   C:\\Program Files\\Python314\\python.exe\n -V:3.13[-64]     C:\\Python313\\python.exe\n";
+        assert_eq!(
+            launcher_paths(listing),
+            vec![
+                PathBuf::from("C:\\Program Files\\Python314\\python.exe"),
+                PathBuf::from("C:\\Python313\\python.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_listing_reads_executable_and_default_install_path() {
+        let output = "
+HKEY_CURRENT_USER\\SOFTWARE\\Python\\PythonCore\\3.14
+    ManagedByPyManager    REG_DWORD    0x1
+HKEY_CURRENT_USER\\SOFTWARE\\Python\\PythonCore\\3.14\\Help
+    (Default)    REG_SZ    C:\\not-an-interpreter.exe
+HKEY_CURRENT_USER\\SOFTWARE\\Python\\PythonCore\\3.14\\InstallPath
+    (Default)    REG_SZ    C:\\Users\\kango\\AppData\\Local\\Python\\pythoncore-3.14-64
+    ExecutablePath    REG_SZ    C:\\Users\\kango\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe
+HKEY_CURRENT_USER\\SOFTWARE\\Python\\PythonCore\\3.13\\InstallPath
+    (Default)    REG_SZ    C:\\Python313
+";
+        assert_eq!(
+            registry_paths(output),
+            vec![
+                PathBuf::from("C:\\Users\\kango\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe"),
+                PathBuf::from("C:\\Users\\kango\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe"),
+                PathBuf::from("C:\\Python313\\python.exe"),
+            ]
+        );
+    }
 }

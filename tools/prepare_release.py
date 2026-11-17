@@ -31,11 +31,12 @@ def clean_file(path: Path) -> bool:
     )
 
 
-def archive_tree(source: Path, output: Path) -> dict:
+def archive_tree(source: Path, output: Path, members: set[str] | None = None) -> dict:
     size = 0
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for path in sorted(source.rglob("*")):
-            if path.is_file() and clean_file(path.relative_to(source)):
+            if (path.is_file() and clean_file(path.relative_to(source))
+                    and (members is None or path.relative_to(source).as_posix() in members)):
                 info = zipfile.ZipInfo(path.relative_to(source).as_posix(), date_time=(2020, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
                 info.external_attr = 0o100644 << 16
@@ -79,6 +80,8 @@ def prepare(engine: Path, embed: Path, assets: Path, resources: Path, release_ba
         shutil.rmtree(resources)
     resources.mkdir(parents=True)
     assets.mkdir(parents=True, exist_ok=True)
+    for previous in assets.glob("fonts*.zip"):
+        previous.unlink()
     copy_tree(REPO / "core", resources / "core")
     browser = resources / "runtime" / "camoufox"
     copy_tree(engine, browser, without_fonts=True)
@@ -90,9 +93,24 @@ def prepare(engine: Path, embed: Path, assets: Path, resources: Path, release_ba
             shutil.copy2(original, browser / relative)
     engine_id = tree_id(browser)
 
-    font_asset = archive_tree(engine / "fonts", assets / "fonts.zip")
-    if font_asset["unpacked_size"] == 0:
-        raise ValueError("The font bundle is empty")
+    try:
+        from tools.font_catalog import index_fonts
+    except ModuleNotFoundError:
+        from font_catalog import index_fonts
+    sys.path.insert(0, str(REPO))
+    from core.identity import COUNTRY_DEFAULTS
+    index = index_fonts(engine / "fonts")
+    index["countries"] = {country: values[2] for country, values in COUNTRY_DEFAULTS.items()}
+    font_packs = []
+    for group, label in index["labels"].items():
+        members = {name for name, entry in index["files"].items() if entry["group"] == group}
+        if not members:
+            continue
+        asset = archive_tree(engine / "fonts", assets / f"fonts-{group}.zip", members)
+        font_packs.append({"id": group, "name": label, "count": len(members), **asset,
+                           "url": release_base.rstrip("/") + "/" + asset["file"]})
+    (assets / "font-index.json").write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    shutil.copy2(assets / "font-index.json", resources / "runtime" / "font-index.json")
 
     # Fresh CI environments do not have fpgen's lazily downloaded model yet.
     # Initialize it before copying site-packages so users receive a complete runtime.
@@ -109,7 +127,7 @@ def prepare(engine: Path, embed: Path, assets: Path, resources: Path, release_ba
         if not site.is_dir():
             raise ValueError("Run using the clean Windows dependency venv")
         for item in site.iterdir():
-            if item.name.startswith(("pip", "setuptools", "_distutils", "wheel")):
+            if item.name.startswith(("pip", "setuptools", "_distutils", "wheel", "fontTools", "fonttools")):
                 continue
             if item.is_dir():
                 copy_tree(item, python / "Lib" / "site-packages" / item.name)
@@ -126,20 +144,22 @@ def prepare(engine: Path, embed: Path, assets: Path, resources: Path, release_ba
 
     import subprocess
     locked = subprocess.check_output([sys.executable, "-m", "pip", "freeze"], text=True)
+    locked = "\n".join(line for line in locked.splitlines() if not line.lower().startswith("fonttools==")) + "\n"
     (assets / "runtime-dependencies.txt").write_text(locked, encoding="utf-8")
     shutil.copy2(assets / "runtime-dependencies.txt", resources / "runtime" / "requirements.txt")
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "engine_id": engine_id,
         "python_version": ".".join(map(str, sys.version_info[:2])),
-        "fonts": {**font_asset, "url": release_base.rstrip("/") + "/" + font_asset["file"]},
+        "font_packs": font_packs,
+        "font_index": index,
         "python": {**python_asset, "url": release_base.rstrip("/") + "/" + python_asset["file"]},
     }
     (resources / "runtime" / "manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     shutil.copy2(resources / "runtime" / "manifest.json", assets / "runtime-manifest.json")
-    print(json.dumps(manifest, indent=2))
+    print(json.dumps({key: value for key, value in manifest.items() if key != "font_index"}, indent=2))
     print(f"Bundled browser core: {sum(p.stat().st_size for p in browser.rglob('*') if p.is_file()) / 1e6:.1f} MB")
     return manifest
 

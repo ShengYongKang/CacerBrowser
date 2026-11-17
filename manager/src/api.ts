@@ -88,9 +88,21 @@ export interface RuntimeStatus {
 export async function runtimeStatus(): Promise<RuntimeStatus> {
   return invoke<RuntimeStatus>("runtime_status");
 }
-export async function installRuntime(kind: "python" | "fonts", proxy: string): Promise<{ path: string }> {
-  return invoke("install_runtime", { kind, proxy });
+export async function installRuntime(kind: "python" | "fonts", proxy: string, fontIds: string[] = []): Promise<{ path: string }> {
+  return invoke("install_runtime", { kind, proxy, fontIds });
 }
+export interface DownloadSettings { proxy: string; mirror: string }
+export const downloadSettings = () => invoke<DownloadSettings>("download_settings");
+export const saveDownloadSettings = (settings: DownloadSettings) => invoke<void>("save_download_settings", { settings });
+export interface FontPack {
+  id: string; name: string; count: number; size: number; unpacked_size: number;
+  cached: boolean; required: boolean;
+}
+export interface FontOverview {
+  development: boolean; ready: boolean; packs: FontPack[]; missing_size: number;
+}
+export const fontOverview = (identityId?: string, country?: string) =>
+  invoke<FontOverview>("font_overview", { identityId: identityId || null, country: country || null });
 export async function cancelRuntime(): Promise<void> {
   return invoke("cancel_runtime");
 }
@@ -296,3 +308,28 @@ export async function extImport(path: string): Promise<ExtensionItem> {
 export async function extRemove(slug: string): Promise<{ slug: string; removed: boolean }> {
   return await invoke("ext_remove", { slug });
 }
+
+// ------------------------------------------------------------ self update
+
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  notes: string;
+  name: string;
+  url: string;
+  size: number;
+  available: boolean;
+}
+
+export interface UpdateStatus {
+  busy: boolean;
+  message: string;
+  downloaded: number;
+  total: number;
+}
+
+export const checkUpdate = () => invoke<UpdateInfo>("check_update");
+export const downloadUpdate = () => invoke<string>("download_update");
+export const updateStatus = () => invoke<UpdateStatus>("update_status");
+export const cancelUpdate = () => invoke<void>("cancel_update");
+export const installUpdate = () => invoke<void>("install_update");

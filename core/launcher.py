@@ -263,6 +263,27 @@ def _silence_gpu_probe(identity) -> None:
         camoufox_utils.host_gpu = lambda *args, **kwargs: (vendor, renderer)
 
 
+def required_font_families(identity) -> list[str]:
+    """Use the same final config as launch; disable download-only addon setup."""
+    import copy
+    import json
+    from camoufox.utils import launch_options
+    from camoufox.addons import DefaultAddons
+
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="cacer-font-preview-") as temporary:
+        options = build_launch_options(copy.deepcopy(identity), profiles_dir=Path(temporary))
+    options["addons"] = []
+    options["exclude_addons"] = list(DefaultAddons)
+    options.pop("proxy", None)
+    resolved = launch_options(**options)
+    chunks = sorted((int(key.rsplit("_", 1)[1]), value)
+                    for key, value in resolved["env"].items()
+                    if key.startswith("CAMOU_CONFIG_"))
+    config = json.loads("".join(value for _, value in chunks))
+    return config.get("fonts", [])
+
+
 def build_launch_options(
     identity,
     *,

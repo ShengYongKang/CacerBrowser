@@ -972,6 +972,19 @@ def cmd_reorder(args):
     return 0
 
 
+def cmd_font_requirements(args):
+    """Resolve the engine's final font draw without starting a browser."""
+    if not args.id or not all(char.isascii() and (char.isalnum() or char in "-_") for char in args.id):
+        raise ValueError("invalid identity id")
+    identity = Identity.load(Path(args.profiles) / args.id / "identity.json")
+    from .launcher import required_font_families
+    print(json.dumps({"fonts": required_font_families(identity),
+                      "country": identity.geo.country,
+                      "languages": identity.geo.languages,
+                      "locale": identity.geo.locale,
+                      "ui_locale": identity.launcher.ui_locale}, ensure_ascii=False))
+
+
 def cmd_launch(args):
     profiles_dir = Path(args.profiles).resolve()
     if runtime_state(profiles_dir, args.id):
@@ -1418,6 +1431,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--ids", required=True,
                    help="comma-separated identity ids in display order")
 
+    p = sub.add_parser("font-requirements")
+    p.add_argument("id")
+
     p = sub.add_parser("launch")
     p.add_argument("id")
     p.add_argument("--no-wait", action="store_true",
@@ -1468,6 +1484,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "list": cmd_list, "create": cmd_create, "clone": cmd_clone, "export": cmd_export, "cookies": cmd_cookies, "import": cmd_import, "rebuild": cmd_rebuild, "delete": cmd_delete,
         "export-all": cmd_export_all, "import-all": cmd_import_all,
         "edit": cmd_edit, "launch": cmd_launch, "stop": cmd_stop,
+        "font-requirements": cmd_font_requirements,
         "reorder": cmd_reorder,
         "status": cmd_status, "_run": cmd_run,
         "history": cmd_history,
