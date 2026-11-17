@@ -172,7 +172,7 @@ def ensure_engine_chrome_css(marker: Optional[str] = None) -> bool:
     directory and the next launch re-appends (self-healing).
     """
     try:
-        from camoufox.pkgman import get_path
+        from .engine import get_path
     except Exception:
         return False
     try:
@@ -215,7 +215,7 @@ def ensure_password_manager() -> None:
     logins.json + key4.db inside the profile, so exports carry them.
     """
     try:
-        from camoufox.pkgman import get_path
+        from .engine import get_path
         path = Path(get_path("distribution/policies.json"))
     except Exception:
         return
@@ -309,6 +309,11 @@ def build_launch_options(
         "persistent_context": True,
         "user_data_dir": str(profile_dir(profiles_dir, identity.id, marker_label)),
     }
+
+    from .engine import bundled_executable
+    executable = bundled_executable()
+    if executable is not None:
+        options["executable_path"] = str(executable)
 
     # Browser chrome prefs. Layout pins MUST ride in firefox_user_prefs:
     # Playwright's launch writes user.js itself (defaultPrefs + these), so

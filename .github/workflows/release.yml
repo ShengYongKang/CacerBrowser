@@ -1,0 +1,183 @@
+name: Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: manager/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.7'
+          architecture: x64
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Set version from tag
+        id: version
+        shell: python
+        run: |
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          config_path = Path("manager/src-tauri/tauri.conf.json")
+          config = json.loads(config_path.read_text(encoding="utf-8"))
+          version = config["version"]
+          if os.environ["GITHUB_REF_TYPE"] == "tag":
+              match = re.fullmatch(r"v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))",
+                                   os.environ["GITHUB_REF_NAME"])
+              if not match:
+                  raise SystemExit("Release tags must use vMAJOR.MINOR.PATCH, for example v0.1.0")
+              version = match[1]
+          config["version"] = version
+          config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+          for name in ("manager/package.json", "manager/package-lock.json"):
+              path = Path(name)
+              data = json.loads(path.read_text(encoding="utf-8"))
+              data["version"] = version
+              if "packages" in data:
+                  data["packages"][""]["version"] = version
+              path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+          for name in ("Cargo.toml", "Cargo.lock"):
+              path = Path("manager/src-tauri") / name
+              text = path.read_text(encoding="utf-8")
+              pattern = r'(name = "shadowfox-manager"\nversion = ")[^"]+(")'
+              text, count = re.subn(pattern, lambda m: m[1] + version + m[2], text)
+              if count != 1:
+                  raise SystemExit(f"Cannot locate application version in {path}")
+              path.write_text(text, encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={version}\n")
+
+      - name: Install frontend dependencies
+        working-directory: manager
+        run: npm ci --include=dev
+
+      - name: Prepare Python and browser dependencies
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python -m pip install "camoufox[geoip]==0.5.8" "playwright==1.62.0" "fpgen==1.3.0" "Pillow==13.0.0"
+          if ($LASTEXITCODE -ne 0) { throw 'Python dependencies failed' }
+          python -m camoufox fetch
+          if ($LASTEXITCODE -ne 0) { throw 'Browser download failed' }
+          python -c "import fpgen; fpgen.generate()"
+          if ($LASTEXITCODE -ne 0) { throw 'Fingerprint model preparation failed' }
+          $env:PYTHON_RUNTIME = python -c "import sys; print(sys.base_prefix)"
+          $env:CAMOUFOX_RUNTIME = python -c "from camoufox.pkgman import camoufox_path; print(camoufox_path(download_if_missing=False))"
+          if ($LASTEXITCODE -ne 0) { throw 'Browser runtime not found' }
+          ./tools/package_runtime.ps1 -Clean
+          python -m pip freeze | Set-Content -Encoding utf8 runtime-dependencies.txt
+
+      - name: Check backend and frontend
+        run: |
+          python -m pip install pytest
+          if ($LASTEXITCODE -ne 0) { throw 'pytest installation failed' }
+          python -m pytest checks -q -p no:cacheprovider
+          if ($LASTEXITCODE -ne 0) { throw 'Backend checks failed' }
+          npm --prefix manager exec -- tsc --noEmit --project manager/tsconfig.json
+          if ($LASTEXITCODE -ne 0) { throw 'TypeScript checks failed' }
+
+      - name: Smoke test packaged runtime with an empty user directory
+        working-directory: manager/src-tauri/resources
+        env:
+          LOCALAPPDATA: ${{ runner.temp }}\cacer-smoke-user
+        run: |
+          @'
+          import tempfile
+          from pathlib import Path
+          from core.identity import create_identity
+          from core.launcher import build_launch_options
+          from camoufox.sync_api import Camoufox
+
+          with tempfile.TemporaryDirectory() as temporary:
+              identity = create_identity(name="Release smoke check", os="windows", country="US")
+              options = build_launch_options(identity, profiles_dir=Path(temporary))
+              expected = Path("runtime/camoufox/camoufox.exe").resolve()
+              assert Path(options["executable_path"]).resolve() == expected
+              options["headless"] = True
+              with Camoufox(**options) as browser:
+                  page = browser.pages[0] if browser.pages else browser.new_page()
+                  page.set_content("<title>Cacer release check</title>")
+                  assert page.title() == "Cacer release check"
+          '@ | ./runtime/python/python.exe -
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged browser smoke check failed' }
+
+      - name: Build Windows x64 installer
+        working-directory: manager
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+
+      - name: Collect release files and SHA256 checksums
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          $installers = @(Get-ChildItem manager/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer' }
+          $name = "Cacer_$($env:RELEASE_VERSION)_windows_x64-setup.exe"
+          Copy-Item -LiteralPath $installers[0].FullName -Destination (Join-Path release-assets $name)
+          Copy-Item runtime-dependencies.txt release-assets/runtime-dependencies.txt
+          Get-ChildItem release-assets -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii release-assets/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cacer-${{ steps.version.outputs.version }}-windows-x64
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Cacer-${{ needs.build.outputs.version }}-windows-x64
+          path: release-assets
+
+      - name: Publish versioned GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --verify-tag \
+            --title "Cacer $RELEASE_VERSION" \
+            --generate-notes

@@ -165,7 +165,7 @@ def _apply_windows_icon(engine: Path, ico: bytes) -> None:
 def ensure_browser_branding() -> None:
     """Reapply after engine upgrades without changing web-facing fingerprints."""
     try:
-        from camoufox.pkgman import get_path
+        from .engine import get_path
         engine = Path(get_path("camoufox.exe")).parent
         _apply_branding(engine)
         _apply_windows_icon(engine, (ASSETS / "icon.ico").read_bytes())

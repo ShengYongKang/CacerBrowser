@@ -31,7 +31,7 @@ function Require-Directory([string]$path, [string]$label) {
 }
 function Copy-Directory([string]$source, [string]$target) {
   New-Item -ItemType Directory -Force -Path $target | Out-Null
-  Copy-Item -LiteralPath (Join-Path $source '*') -Destination $target -Recurse -Force
+  Get-ChildItem -LiteralPath $source -Force | Copy-Item -Destination $target -Recurse -Force
 }
 
 $pythonSource = $env:PYTHON_RUNTIME
@@ -47,6 +47,12 @@ if ([string]::IsNullOrWhiteSpace($camoufoxSource)) {
 Require-Directory $pythonSource 'Python runtime'
 Require-Directory $camoufoxSource 'Camoufox runtime'
 if ($artiSource) { Require-Directory $artiSource 'arti runtime' }
+if (-not (Test-Path -LiteralPath (Join-Path $pythonSource 'python.exe') -PathType Leaf)) {
+  throw 'Python runtime must contain python.exe at its root; a development venv cannot be used.'
+}
+if (-not (Test-Path -LiteralPath (Join-Path $camoufoxSource 'camoufox.exe') -PathType Leaf)) {
+  throw 'Camoufox runtime must point to the active Windows engine directory containing camoufox.exe.'
+}
 
 if ($Clean -and (Test-Path $resourceRoot)) {
   Remove-Item -LiteralPath $resourceRoot -Recurse -Force
@@ -72,5 +78,8 @@ Write-Host "Prepared packaged runtime at: $resourceRoot" -ForegroundColor Green
 Write-Host "Next: cd manager; npm run tauri build"
 if ($Build) {
   Push-Location (Join-Path $repo 'manager')
-  try { npm run tauri build } finally { Pop-Location }
+  try {
+    npm run tauri build
+    if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed.' }
+  } finally { Pop-Location }
 }

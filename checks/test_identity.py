@@ -146,6 +146,32 @@ def test_country_filter_and_geo_coherence(tmp_path):
 # ------------------------------------------------------------ launcher
 
 
+def test_bundled_engine_is_used_for_launch_and_resources(tmp_path, monkeypatch):
+    from core import engine, branding, extensions, launcher
+    resources = tmp_path / "installed app" / "resources"
+    executable = resources / "runtime" / "camoufox" / "camoufox.exe"
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    monkeypatch.setattr(engine, "__file__", str(resources / "core" / "engine.py"))
+    monkeypatch.setattr(branding, "ensure_browser_branding", lambda: None)
+    monkeypatch.setattr(extensions, "sync_profile_extensions", lambda *args: None)
+    monkeypatch.setattr(launcher, "_silence_gpu_probe", lambda *args: None)
+
+    assert engine.get_path("properties.json") == str(executable.parent / "properties.json")
+    opts = build_launch_options(make_identity(), profiles_dir=tmp_path / "profiles")
+    assert opts["executable_path"] == str(executable)
+
+
+def test_development_engine_uses_camoufox_installation(tmp_path, monkeypatch):
+    from core import engine
+    import camoufox.pkgman
+    monkeypatch.setattr(engine, "__file__", str(tmp_path / "core" / "engine.py"))
+    monkeypatch.setattr(camoufox.pkgman, "get_path", lambda name: f"installed/{name}")
+
+    assert engine.bundled_executable() is None
+    assert engine.get_path("properties.json") == "installed/properties.json"
+
+
 def test_launch_options_mapping(tmp_path):
     ident = make_identity(network_mode="proxy")
     ident.proxy_server = "socks5://127.0.0.1:9150"

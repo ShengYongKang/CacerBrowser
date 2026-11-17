@@ -171,7 +171,7 @@ def _manifest_meta(directory: Path) -> Dict[str, str]:
 
 def _engine_dir() -> Optional[Path]:
     try:
-        from camoufox.pkgman import get_path
+        from .engine import get_path
         path = Path(get_path(ENGINE_ADDON_PATH))
     except Exception:
         return None

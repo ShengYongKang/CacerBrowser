@@ -36,6 +36,34 @@ npm run tauri build
 .\.venv\Scripts\python.exe -m pytest checks -q
 ```
 
+## GitHub 自动构建与版本发布
+
+仓库的 `.github/workflows/release.yml` 使用 GitHub Actions 构建 Windows x64 安装包。推送 `v主版本.次版本.修订号` 标签时自动创建同名 Release，各版本独立保留；例如 `v0.1.0`、`v0.1.1`、`v0.2.0`。目前只接受正式版本标签。
+
+在仓库根目录发布一个版本：
+
+```powershell
+git push origin main
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+标签指向的提交就是发布源码，应在提交完成后再打标签。版本号会在构建环境中同步到 Tauri、npm 和 Cargo 配置，不需要手动修改多个文件。已发布的标签和安装包应保留；修复问题后使用新版本号发布。
+
+打开仓库的 **Actions → Windows Release** 查看进度。流程会安装固定版本的 Python 和主要运行依赖，下载 Camoufox 配套引擎与指纹模型，运行后端校验、TypeScript 检查和打包运行时的真实浏览器启动检查，然后构建 NSIS 安装包。构建或校验失败时不会发布 Release。
+
+成功后，其他人进入仓库的 **Releases**，选择版本，在 **Assets** 下载：
+
+- `Cacer_0.1.0_windows_x64-setup.exe`：Windows 64 位安装包，包含 Python、Python 依赖、指纹模型和浏览器引擎。
+- `SHA256SUMS.txt`：下载文件的 SHA256 校验值。
+- `runtime-dependencies.txt`：本次打包的 Python 依赖及版本。
+
+安装使用无需单独安装 Python、Node.js 或 Rust。WebView2 缺失时安装器会联网安装；代理订阅功能仍需配置本机可用的 mihomo/Clash 内核。安装包未配置 Windows 代码签名。
+
+只想验证构建时，可在 **Actions → Windows Release → Run workflow** 选择分支手动运行。产物保存在该次运行的 **Artifacts**，保留 14 天；手动运行不会创建 Release。
+
+工作流使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需添加个人令牌。如果组织禁用了 Actions 或禁止工作流写入仓库，需要由仓库管理员开放相应权限。仓库为私有时，Release 下载也需要仓库访问权限；面向所有人下载需要公开仓库。
+
 ## 自动化校验脚本
 
 `checks/` 下的三个脚本用于开发时检查后端行为，修改相关功能后可运行。保留 `test_*.py` 文件名，便于 pytest 自动发现用例。
