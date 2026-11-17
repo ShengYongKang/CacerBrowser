@@ -75,11 +75,16 @@ Get-ChildItem -LiteralPath $resourceRoot -Recurse -File -Force |
   Remove-Item -Force
 
 Write-Host "Prepared packaged runtime at: $resourceRoot" -ForegroundColor Green
-Write-Host "Next: cd manager; npm run tauri build"
+Write-Host 'Next: cd manager; $env:NSISCONFDIR = (Resolve-Path .\src-tauri\nsis).Path; npm run tauri build'
 if ($Build) {
   Push-Location (Join-Path $repo 'manager')
+  $previousNsisConfig = $env:NSISCONFDIR
   try {
+    $env:NSISCONFDIR = Join-Path $repo 'manager\src-tauri\nsis'
     npm run tauri build
     if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed.' }
-  } finally { Pop-Location }
+  } finally {
+    $env:NSISCONFDIR = $previousNsisConfig
+    Pop-Location
+  }
 }

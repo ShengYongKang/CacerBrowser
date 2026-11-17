@@ -21,6 +21,7 @@ npm run tauri dev
 
 ```powershell
 cd manager
+$env:NSISCONFDIR = (Resolve-Path .\src-tauri\nsis).Path
 npm run tauri build
 .\src-tauri\target\release\cacer-manager.exe
 ```
