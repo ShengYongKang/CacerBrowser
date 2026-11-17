@@ -28,6 +28,11 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
+    "windows": {
+      "nsis": {
+        "template": "nsis/installer.nsi"
+      }
+    },
     "icon": ["icons/icon.ico", "icons/icon.png"],
     "resources": [
       "resources/core",
