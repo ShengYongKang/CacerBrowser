@@ -18,6 +18,7 @@ target/
 *.tsbuildinfo
 /vendor/
 /runtime/
+/runtime-cache/
 /manager/src-tauri/gen/
 /manager/src-tauri/resources/core/*
 !/manager/src-tauri/resources/core/.gitkeep

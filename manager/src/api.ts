@@ -78,8 +78,33 @@ export interface SystemProxy {
   server: string;
 }
 
+export interface RuntimeStatus {
+  busy: boolean;
+  message: string;
+  downloaded: number;
+  total: number;
+}
+
+export async function runtimeStatus(): Promise<RuntimeStatus> {
+  return invoke<RuntimeStatus>("runtime_status");
+}
+export async function installRuntime(kind: "python" | "fonts", proxy: string): Promise<{ path: string }> {
+  return invoke("install_runtime", { kind, proxy });
+}
+export async function cancelRuntime(): Promise<void> {
+  return invoke("cancel_runtime");
+}
+export async function selectPython(path: string): Promise<EnvironmentCheck> {
+  return invoke("select_python", { path });
+}
+
 export interface EnvironmentCheck {
   ready: boolean;
+  dependencies_ready: boolean;
+  fonts_ready: boolean;
+  python_size: number | null;
+  fonts_size: number | null;
+  manual_commands: string;
   root: string;
   checks: Array<{ key: string; label: string; ok: boolean; detail: string }>;
 }

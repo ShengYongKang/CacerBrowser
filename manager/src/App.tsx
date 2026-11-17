@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import {
   ClashConfig, CreateRequest, DataOverview, EditRequest, ExtensionItem, ExtensionSearchResult, HistoryItem, Identity, ProxyNode, ProxySource,
+  cancelRuntime, installRuntime, runtimeStatus, selectPython, type RuntimeStatus,
   clashConfigs, cloneIdentity, createIdentity, dataOverview, deleteIdentity, editIdentity, environmentCheck,
   exportAllData, exportCookies, exportPack, extImport, extInstall, extList, extRemove, extSearch, importAllData, importPack, launchHistory, launchIdentity, listIdentities, openDataDir,
   proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, type EnvironmentCheck,
@@ -93,7 +94,13 @@ export default function App() {
   const [editForm, setEditForm] = useState<EditRequest>({});
   const [netChoice, setNetChoice] = useState<"direct" | "sub" | "custom">("direct");
   const [editNetChoice, setEditNetChoice] = useState<"direct" | "sub" | "custom">("direct");
-  const [guide, setGuide] = useState<"python" | "engine" | null>(null);
+  const [guide, setGuide] = useState<"python" | "engine" | "fonts" | null>(null);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
+  const runtimeBusyRef = useRef(false);
+  const [downloadState, setDownloadState] = useState<RuntimeStatus | null>(null);
+  const [downloadProxy, setDownloadProxy] = useState("");
+  const [pythonPath, setPythonPath] = useState("");
+  const environmentRef = useRef<EnvironmentCheck | null>(null);
   const [copied, setCopied] = useState(false);
   const [proxySourceList, setProxySourceList] = useState<ProxySource[]>([]);
   const [proxyCore, setProxyCore] = useState<{ found: boolean; path: string | null } | null>(null);
@@ -121,9 +128,7 @@ export default function App() {
   const hasActive = identities.some((it) => it.running || it.status === "starting");
 
   useEffect(() => {
-    refresh();
-    loadExtensions();
-    environmentCheck().then(setEnvironment).catch((e) => setError(String(e)));
+    checkEnvironment();
   }, []);
   useEffect(() => {
     const timer = setInterval(() => {
@@ -152,6 +157,7 @@ export default function App() {
     return () => document.removeEventListener("contextmenu", block);
   }, []);
   function refresh(afterMutation = false): Promise<void> {
+    if (!environmentRef.current?.ready) return Promise.resolve();
     // Polls share a pending read; completed mutations request one fresh read.
     if (refreshRequest.current) {
       if (afterMutation) refreshQueued.current = true;
@@ -167,14 +173,57 @@ export default function App() {
     })().finally(() => { refreshRequest.current = null; });
     return refreshRequest.current;
   }
-  async function checkEnvironment() { try { setEnvironment(await environmentCheck()); } catch (e) { setError(String(e)); } }
+  async function checkEnvironment() {
+    try {
+      const result = await environmentCheck();
+      environmentRef.current = result;
+      setEnvironment(result);
+      if (result.ready) { setError(null); await refresh(true); await loadExtensions(); }
+      return result;
+    } catch (e) { setError(String(e)); return null; }
+  }
+  async function setupRuntime(kind: "python" | "fonts"): Promise<boolean> {
+    if (runtimeBusyRef.current) return false;
+    runtimeBusyRef.current = true;
+    setRuntimeBusy(true);
+    setError(null);
+    setDownloadState({ busy: true, message: "正在准备", downloaded: 0, total: 0 });
+    const timer = window.setInterval(() => runtimeStatus().then(setDownloadState).catch(() => {}), 500);
+    try {
+      await installRuntime(kind, downloadProxy);
+      await checkEnvironment();
+      setNotice(kind === "python" ? "Python 与依赖已准备完成" : "浏览器字体已准备完成，后续可离线使用");
+      return true;
+    } catch (e) { setError(String(e)); return false; }
+    finally {
+      window.clearInterval(timer);
+      runtimeBusyRef.current = false;
+      setRuntimeBusy(false);
+      setDownloadState(null);
+    }
+  }
+  async function applyPython() {
+    if (runtimeBusyRef.current) return;
+    runtimeBusyRef.current = true;
+    setRuntimeBusy(true);
+    try { await selectPython(pythonPath); await checkEnvironment(); }
+    catch (e) { setError(String(e)); }
+    finally { runtimeBusyRef.current = false; setRuntimeBusy(false); }
+  }
+  async function launchPrepared(id: string) {
+    if (!environmentRef.current?.ready) { setGuide("python"); return; }
+    if (!environmentRef.current.fonts_ready) {
+      setGuide("fonts");
+      if (!(await setupRuntime("fonts"))) return;
+      setGuide(null);
+    }
+    await launchIdentity(id);
+  }
   const failedKeys = environment?.checks.filter((check) => !check.ok).map((check) => check.key) ?? [];
   const pythonMissing = failedKeys.includes("python");
   const engineMissing = failedKeys.includes("engine");
-  const guideText = guide === "python"
-    ? "下载并安装 Python 3.12.10（安装时勾选 Add python.exe to PATH），或安装到软件目录下的 runtime\\python：\nhttps://mirrors.huaweicloud.com/python/3.12.10/python-3.12.10-amd64.exe\n\n完成后点「重新检查」。"
-    : "1. 安装依赖（已装可跳过）\npip install -i https://pypi.tuna.tsinghua.edu.cn/simple \"camoufox[geoip]\" playwright pysocks\n\n2. 下载浏览器引擎（约 700 MB，需要能访问 GitHub）\npython -m camoufox fetch\n\n3. 若第 2 步直连 GitHub 超时，先设置代理再重试\n$env:HTTPS_PROXY=\"socks5h://127.0.0.1:<你的代理端口>\"";
-  function openGuide(kind: "python" | "engine") { setCopied(false); setGuide(kind); }
+  const guideText = environment?.manual_commands ?? "正在读取安装命令…";
+  function openGuide(kind: "python" | "engine" | "fonts") { setCopied(false); setGuide(kind); }
   async function copyGuide() {
     try {
       await navigator.clipboard.writeText(guideText);
@@ -202,6 +251,7 @@ export default function App() {
     }
   }
   async function loadProxy() {
+    if (!environmentRef.current?.ready) return [];
     try {
       const overview = await proxySources();
       setProxySourceList(overview.sources);
@@ -242,9 +292,11 @@ export default function App() {
     try { setDataInfo(await dataOverview()); } catch (e) { setError(String(e)); }
   }
   async function loadHistory() {
+    if (!environmentRef.current?.ready) return;
     try { setHistory((await launchHistory(80)).items); } catch (e) { setError(String(e)); }
   }
   async function loadExtensions() {
+    if (!environmentRef.current?.ready) return;
     try { setExtItems((await extList()).extensions); } catch (e) { setError(String(e)); }
   }
   function searchExtensions() {
@@ -572,6 +624,25 @@ export default function App() {
       : <p className="hint">还没有身份包。在环境编辑窗口点「导出身份」即可保存到此处。</p>}
   </>;
 
+  const runtimeControls = <section className="edit-section">
+    <h4>运行环境</h4>
+    <p className="hint">Python 可快捷下载到应用专用目录，也可手动安装后指定解释器。浏览器字体首次启动时下载，所有环境共用缓存。</p>
+    <label className="edit-field"><span>下载代理（可选）</span><input value={downloadProxy} onChange={(e) => setDownloadProxy(e.target.value)} placeholder="http://127.0.0.1:7890" disabled={runtimeBusy} /></label>
+    <div className="settings-actions">
+      <button className="primary" disabled={runtimeBusy} onClick={() => setupRuntime("python")}>快捷安装 Python 与依赖{environment?.python_size ? `（${formatSize(environment.python_size)}）` : ""}</button>
+      <button className="secondary" disabled={runtimeBusy || environment?.fonts_ready} onClick={() => setupRuntime("fonts")}>{environment?.fonts_ready ? "字体已就绪" : `下载字体${environment?.fonts_size ? `（${formatSize(environment.fonts_size)}）` : ""}`}</button>
+      <button className="secondary" disabled={runtimeBusy} onClick={checkEnvironment}>重新检查</button>
+    </div>
+    {downloadState && <div className="form-progress" role="status">{downloadState.message}{downloadState.total > 0 && <> · {formatSize(downloadState.downloaded)} / {formatSize(downloadState.total)}<progress max={downloadState.total} value={downloadState.downloaded} /></>}<button className="secondary" onClick={() => cancelRuntime().catch((e) => setError(String(e)))}>取消</button></div>}
+    <details><summary>手动安装 Python / 使用已有 Python</summary>
+      <p className="hint">将以下命令复制到 PowerShell 执行。已有 Python 时可以跳过安装步骤，再填入已安装依赖的解释器路径。</p>
+      <pre className="cmd-block">{guideText}</pre>
+      <button className="secondary" onClick={copyGuide}>{copied ? "已复制" : "复制安装命令"}</button>
+      <label className="edit-field"><span>Python 解释器路径</span><input value={pythonPath} onChange={(e) => setPythonPath(e.target.value)} placeholder="C:\\…\\Scripts\\python.exe" disabled={runtimeBusy} /></label>
+      <button className="secondary" onClick={applyPython} disabled={runtimeBusy || !pythonPath.trim()}>检查并使用此 Python</button>
+    </details>
+  </section>;
+
   return <main className="app-shell">
     <aside className="sidebar">
       <div className="brand"><img className="brand-mark" src={APP_ICON} alt="" /><div><strong>Cacer</strong><span>隐私浏览工作台</span></div></div>
@@ -601,7 +672,7 @@ export default function App() {
         {view === "environments" && <>
           <div className="page-heading"><div><div className="eyebrow">ENVIRONMENT MANAGER</div><h1>浏览器环境</h1><p>管理独立身份、网络配置与浏览器运行状态。</p></div><button className="primary large" onClick={openCreate}>＋ 新建环境</button></div>
         <section className="panel"><div className="toolbar"><div className="search-box"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索环境名称、国家或代理" /></div><div className="toolbar-right"><span className="result-count">共 {visible.length} 个环境</span>{!search.trim() && identities.length > 1 && <span className="drag-hint">拖动环境行可调整顺序</span>}</div></div>
-          {visible.length === 0 ? <div className="empty"><img className="empty-mark" src={APP_ICON} alt="" /><h3>{identities.length ? "没有匹配的环境" : "开始创建第一个环境"}</h3><p>{identities.length ? "尝试更换搜索关键词。" : "为不同的浏览任务创建隔离的浏览器身份。"}</p>{!identities.length && <button className="primary" onClick={openCreate}>＋ 新建环境</button>}</div> : <div className="table-wrap"><table><thead><tr><th>环境</th><th>状态</th><th>设备</th><th>网络</th><th>地区 / 语言</th><th className="actions-head">操作</th></tr></thead><tbody>{visible.map((it) => <tr key={it.id} draggable={canDrag} className={dragId === it.id ? "row-dragging" : dragOverId === it.id && dragId !== it.id ? "row-drop-target" : undefined} onDragStart={(e) => startDrag(e, it.id)} onDragOver={(e) => overRow(e, it.id)} onDrop={(e) => dropRow(e, it.id)} onDragEnd={endDrag}><td><div className="profile-cell"><div className="country-avatar"><Flag country={it.country} size={26} /></div><div><strong>{it.name || it.id}</strong><span onMouseEnter={(e) => showNoteTip(e, it.note)} onMouseLeave={hideNoteTip}>{inlineNote(it.note) || `创建于 ${it.created_at?.slice(0, 10) ?? "—"}`}</span></div></div></td><td><span className={`status ${it.status === "starting" ? "starting" : it.running ? "online" : "offline"}`}><i />{it.status === "starting" ? "启动中" : it.running ? "运行中" : "已停止"}</span></td><td><span className="device"><b>{OS_ICONS[it.os] ?? "◈"}</b>{OS_LABELS[it.os] ?? it.os}</span></td><td><span className="network" title={it.proxy_node ?? it.proxy_server ?? undefined}><i className={it.network_mode === "direct" ? "direct" : "proxy"} />{it.network_mode === "direct" ? "直连" : it.proxy_node ?? "代理"}</span></td><td><span className="locale"><Flag country={it.country} size={17} /> {it.country || "自动"}<small>{it.languages?.[0] ?? it.locale}</small></span></td><td><div className="table-actions">{it.running || it.status === "starting" ? <button className="action stop-action" disabled={busy.has(`stop-${it.id}`)} onClick={() => withBusy(`stop-${it.id}`, () => stopIdentity(it.id))}>{it.status === "starting" ? "取消" : "停止"}</button> : <button className="action launch-action" disabled={busy.has(`launch-${it.id}`)} onClick={() => withBusy(`launch-${it.id}`, () => launchIdentity(it.id))}>启动</button>}<button className="more-action" onClick={() => openEdit(it)}>编辑</button><button className="more-action danger-text" disabled={it.running} onClick={() => remove(it)}>删除</button></div></td></tr>)}</tbody></table></div>}
+          {visible.length === 0 ? <div className="empty"><img className="empty-mark" src={APP_ICON} alt="" /><h3>{identities.length ? "没有匹配的环境" : "开始创建第一个环境"}</h3><p>{identities.length ? "尝试更换搜索关键词。" : "为不同的浏览任务创建隔离的浏览器身份。"}</p>{!identities.length && <button className="primary" onClick={openCreate}>＋ 新建环境</button>}</div> : <div className="table-wrap"><table><thead><tr><th>环境</th><th>状态</th><th>设备</th><th>网络</th><th>地区 / 语言</th><th className="actions-head">操作</th></tr></thead><tbody>{visible.map((it) => <tr key={it.id} draggable={canDrag} className={dragId === it.id ? "row-dragging" : dragOverId === it.id && dragId !== it.id ? "row-drop-target" : undefined} onDragStart={(e) => startDrag(e, it.id)} onDragOver={(e) => overRow(e, it.id)} onDrop={(e) => dropRow(e, it.id)} onDragEnd={endDrag}><td><div className="profile-cell"><div className="country-avatar"><Flag country={it.country} size={26} /></div><div><strong>{it.name || it.id}</strong><span onMouseEnter={(e) => showNoteTip(e, it.note)} onMouseLeave={hideNoteTip}>{inlineNote(it.note) || `创建于 ${it.created_at?.slice(0, 10) ?? "—"}`}</span></div></div></td><td><span className={`status ${it.status === "starting" ? "starting" : it.running ? "online" : "offline"}`}><i />{it.status === "starting" ? "启动中" : it.running ? "运行中" : "已停止"}</span></td><td><span className="device"><b>{OS_ICONS[it.os] ?? "◈"}</b>{OS_LABELS[it.os] ?? it.os}</span></td><td><span className="network" title={it.proxy_node ?? it.proxy_server ?? undefined}><i className={it.network_mode === "direct" ? "direct" : "proxy"} />{it.network_mode === "direct" ? "直连" : it.proxy_node ?? "代理"}</span></td><td><span className="locale"><Flag country={it.country} size={17} /> {it.country || "自动"}<small>{it.languages?.[0] ?? it.locale}</small></span></td><td><div className="table-actions">{it.running || it.status === "starting" ? <button className="action stop-action" disabled={busy.has(`stop-${it.id}`)} onClick={() => withBusy(`stop-${it.id}`, () => stopIdentity(it.id))}>{it.status === "starting" ? "取消" : "停止"}</button> : <button className="action launch-action" disabled={busy.has(`launch-${it.id}`)} onClick={() => withBusy(`launch-${it.id}`, () => launchPrepared(it.id))}>启动</button>}<button className="more-action" onClick={() => openEdit(it)}>编辑</button><button className="more-action danger-text" disabled={it.running} onClick={() => remove(it)}>删除</button></div></td></tr>)}</tbody></table></div>}
         </section>
         </>}
         {view === "proxy" && <>
@@ -674,6 +745,7 @@ export default function App() {
       {netChoice === "custom" && <label className="wide"><span>代理服务器</span><input value={form.proxy_server ?? ""} placeholder="127.0.0.1:8080（默认 HTTP）" onChange={(e) => setForm({ ...form, proxy_server: e.target.value })} /></label>}</div><div className="modal-footer"><button className="secondary" disabled={busy.has("create")} onClick={() => setShowCreate(false)}>取消</button><button className="primary" disabled={!valid || busy.has("create")} onClick={create}>{busy.has("create") ? "生成中…" : "生成环境"}</button></div></Modal>}
     {showSettings && <Modal title="设置" onClose={() => setShowSettings(false)}>
       {error && <div className="form-error">{error}</div>}
+      {runtimeControls}
       <section className="edit-section">{dataBlock}</section>
     </Modal>}
     {showClash && <Modal title="扫描到的 Clash 配置" onClose={() => setShowClash(false)}>
@@ -691,7 +763,12 @@ export default function App() {
         </>}
       <div className="modal-footer"><button className="secondary" onClick={() => setShowClash(false)} disabled={!!subBusy}>关闭</button><button className="primary" onClick={importAllClash} disabled={!!subBusy || localClashConfigs.length === 0}>全部导入</button></div>
     </Modal>}
-    {guide && <Modal title={guide === "python" ? "Python 运行时安装说明" : "Camoufox 引擎安装说明"} onClose={() => setGuide(null)}><div className="form-intro">{guide === "python" ? "未检测到可用的 Python。请手动安装后点「重新检查」。" : "当前环境缺少浏览器引擎。请在 PowerShell 中执行下面的命令，完成后点「重新检查」。"}</div><pre className="cmd-block">{guideText}</pre><div className="modal-footer"><button className="secondary" onClick={() => setGuide(null)}>关闭</button><button className="primary" onClick={copyGuide}>{copied ? "已复制" : "复制"}</button></div></Modal>}
+    {guide && <Modal title={guide === "fonts" ? "准备浏览器字体" : "运行环境设置"} onClose={() => { if (!runtimeBusy) setGuide(null); }}>
+      {error && <div className="form-error">{error}</div>}
+      {guide === "engine" && <p className="hint">安装包已包含浏览器核心。若文件缺失，请重新安装当前版本。</p>}
+      {runtimeControls}
+      <div className="modal-footer"><button className="secondary" disabled={runtimeBusy} onClick={() => setGuide(null)}>关闭</button></div>
+    </Modal>}
     {editTarget && <Modal title="编辑环境" onClose={() => setEditTarget(null)}><section className="edit-section"><h4>身份指纹</h4><div className="fpinfo"><span><Flag country={editTarget.country} size={16} /> {editTarget.country || "自动地区"}</span><span>{OS_ICONS[editTarget.os]} {OS_LABELS[editTarget.os] ?? editTarget.os}</span><span>◷ {editTarget.timezone}</span><span>文 {editTarget.languages?.[0] ?? editTarget.locale}</span></div><p className="hint">设备指纹保持不变，以维持 Cookie 和登录状态的一致性。</p></section><section className="edit-section"><h4>基本信息</h4><div className="grid"><label><span>环境名称</span><input value={editForm.name ?? ""} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={editForm.note ?? ""} onChange={(e) => setEditForm({ ...editForm, note: e.target.value })} /></label><label><span>设备系统</span><select value={editForm.os ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={editForm.country ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="wide"><span>浏览器界面语言</span><select value={editForm.ui_locale ?? ""} onChange={(e) => setEditForm({ ...editForm, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option>{editForm.ui_locale && editForm.ui_locale !== "zh-CN" && <option value={editForm.ui_locale}>当前：{editForm.ui_locale}</option>}</select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。修改后下次启动生效。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(editForm.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setEditForm({ ...editForm, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">开启后页面回访与前进/后退直接读内存缓存，代理环境下更流畅。修改后下次启动生效。</small></label></div></section><section className="edit-section"><h4>网络方式</h4><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" disabled={editLive} key={value} className={editNetChoice === value ? "seg-on" : "seg-off"} onClick={() => setEditNetChoice(value)}>{label}</button>)}</div>
       {editNetChoice === "sub" && <div className="grid">
         <label><span>代理订阅</span><select value={editForm.proxy_source ?? ""} disabled={editLive} onChange={(e) => chooseSubSource(e.target.value, true)}><option value="">选择订阅…</option>{proxySourceList.map((s) => <option key={s.name} value={s.name}>{s.label}（{s.nodes} 个节点）</option>)}</select>{!proxySourceList.length && <small className="field-hint">还没有订阅，请先在「代理管理」中导入。</small>}</label>

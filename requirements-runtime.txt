@@ -1,0 +1,6 @@
+# Direct runtime dependencies. CI publishes the complete resolved dependency lock.
+camoufox[geoip]==0.5.8
+playwright==1.62.0
+fpgen==1.3.0
+Pillow==13.0.0
+PySocks==1.7.1

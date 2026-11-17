@@ -1003,7 +1003,7 @@ def cmd_launch(args):
         if pythonw.is_file():
             helper_python = str(pythonw)
     proc = subprocess.Popen(
-        [helper_python, "-m", "core.cli",
+        [helper_python, str(Path(__file__).with_name("bootstrap.py")),
          "--profiles", str(profiles_dir),
          "_run", args.id],
         creationflags=creationflags,

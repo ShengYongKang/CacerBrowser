@@ -1,3 +1,5 @@
+mod runtime;
+
 use serde_json::Value;
 use std::io::Read;
 use std::path::PathBuf;
@@ -61,6 +63,9 @@ fn system_python() -> Option<PathBuf> {
 /// otherwise fall back to the machine-wide Python. The resolved interpreter is
 /// cached: without it every 3s `list` poll also re-probed `py -3`/`python`.
 fn python_path(root: &PathBuf) -> PathBuf {
+    if let Some(path) = runtime::selected_python(root).or_else(|| runtime::prepared_python(root)) {
+        return path;
+    }
     static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     if let Some(path) = CACHE.get() {
         return path.clone();
@@ -212,14 +217,14 @@ fn run_cli(args: &[&str]) -> Result<Value, String> {
     let data_root = storage_root(&root);
     let profiles = data_root.join("profiles");
     let mut child = silent_command(&python)
-        .arg("-m")
-        .arg("core.cli")
+        .arg(code.join("core/bootstrap.py"))
         .arg("--profiles")
         .arg(&profiles)
         .args(args)
         .current_dir(&code)
         .env("PYTHONPATH", &code)
         .env("PYTHONIOENCODING", "utf-8")
+        .envs(runtime::prepared_engine(&root).map(|path| ("CACER_ENGINE_DIR", path)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -317,6 +322,10 @@ async fn list_identities() -> Result<Value, String> {
 /// runtime required by the current development distribution.
 #[tauri::command]
 async fn environment_check() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(environment_check_sync).await.map_err(|e| e.to_string())?
+}
+
+fn environment_check_sync() -> Result<Value, String> {
     let root = project_root();
     let data_root = storage_root(&root);
     let python = python_path(&root);
@@ -331,7 +340,7 @@ async fn environment_check() -> Result<Value, String> {
     let camoufox_import_ok = python_ok
         && run_with_timeout(
             &python,
-            &["-c", "import camoufox"],
+            &["-c", "import camoufox, playwright, fpgen, PIL, socks"],
             &code_root(&root),
             std::time::Duration::from_secs(10),
         )
@@ -340,8 +349,8 @@ async fn environment_check() -> Result<Value, String> {
         serde_json::json!({
             "key": "python",
             "label": "Python 运行时",
-            "ok": python_ok,
-            "detail": if python_ok { python.display().to_string() } else { "未检测到系统 Python，可一键安装".to_string() }
+            "ok": python_ok && camoufox_import_ok,
+            "detail": if camoufox_import_ok { python.display().to_string() } else { "Python 或运行依赖未就绪，可快捷安装或手动配置".to_string() }
         }),
         serde_json::json!({
             "key": "cli",
@@ -358,22 +367,56 @@ async fn environment_check() -> Result<Value, String> {
         serde_json::json!({
             "key": "engine",
             "label": "Camoufox 浏览器引擎",
-            "ok": engine_ok && camoufox_import_ok,
-            "detail": if !camoufox_import_ok {
-                "未安装 camoufox 依赖，可一键安装".to_string()
-            } else if let Some(exe) = &camoufox_exe {
+            "ok": engine_ok,
+            "detail": if let Some(exe) = &camoufox_exe {
                 exe.display().to_string()
             } else {
-                "未下载浏览器引擎，可一键安装（约 700 MB）".to_string()
+                "浏览器核心缺失，请重新安装当前版本".to_string()
             }
         }),
     ];
+    let manifest = runtime::manifest(&root).ok();
     Ok(serde_json::json!({
         "ready": python_ok && cli_ok && profiles_ok && engine_ok && camoufox_import_ok,
         "root": root.display().to_string(),
         "data_root": data_root.display().to_string(),
+        "dependencies_ready": camoufox_import_ok,
+        "fonts_ready": manifest.is_none() || runtime::prepared_engine(&root).is_some(),
+        "python_size": manifest.as_ref().map(|m| m.python.size),
+        "fonts_size": manifest.as_ref().map(|m| m.fonts.size),
+        "manual_commands": runtime::guide(&root).unwrap_or_else(|_| "开发环境：python -m pip install -r requirements-runtime.txt".into()),
         "checks": checks
     }))
+}
+
+#[tauri::command]
+fn runtime_status() -> runtime::Status { runtime::status() }
+
+#[tauri::command]
+fn cancel_runtime() { runtime::cancel(); }
+
+#[tauri::command]
+async fn install_runtime(kind: String, proxy: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime::operation(|| {
+            let root = project_root();
+            let path = runtime::install(&root, &kind, &proxy)?;
+            if kind == "python" {
+                runtime::select_python(&root, &path.join("python.exe").to_string_lossy())?;
+            }
+            Ok(serde_json::json!({ "path": path }))
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn select_python(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime::operation(|| {
+            runtime::select_python(&project_root(), &path)?;
+            environment_check_sync()
+        })
+    }).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -575,6 +618,10 @@ async fn delete_identity(id: String, purge: bool) -> Result<Value, String> {
 
 #[tauri::command]
 async fn launch_identity(id: String) -> Result<Value, String> {
+    let root = project_root();
+    if runtime::manifest(&root).is_ok() && runtime::prepared_engine(&root).is_none() {
+        return Err("请先下载浏览器字体".into());
+    }
     // The Python CLI supervises the detached browser helper. Returning after
     // the helper publishes `starting` keeps the Tauri UI responsive; the
     // frontend refresh loop observes the later `running` state.
@@ -876,6 +923,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_identities,
             environment_check,
+            runtime_status,
+            cancel_runtime,
+            install_runtime,
+            select_python,
             create_identity,
             edit_identity,
             reorder_identities,

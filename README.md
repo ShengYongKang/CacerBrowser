@@ -27,7 +27,7 @@ npm run tauri build
 
 也可双击编译生成的 `cacer-manager.exe`，或安装 `manager/src-tauri/target/release/bundle/` 内的安装包。项目不依赖 VBS 启动脚本。
 
-构建完整运行时资源时，先在仓库根目录运行 `tools/package_runtime.ps1`；所需环境变量及用法见脚本注释。
+构建发布资源时，使用干净的 Python 虚拟环境安装 `requirements-runtime.txt`，再运行 `tools/package_runtime.ps1`。脚本需要 `CAMOUFOX_RUNTIME`、官方嵌入式 Python ZIP 和目标版本的 Release 下载地址；具体参数见脚本注释。它会保留浏览器核心，将字体和 Python 分别打包为 Release 附件。
 
 后端命令行可在仓库根目录运行：
 
@@ -50,15 +50,24 @@ git push origin v0.1.0
 
 标签指向的提交就是发布源码，应在提交完成后再打标签。版本号会在构建环境中同步到 Tauri、npm 和 Cargo 配置，不需要手动修改多个文件。已发布的标签和安装包应保留；修复问题后使用新版本号发布。
 
-打开仓库的 **Actions → Windows Release** 查看进度。流程会安装固定版本的 Python 和主要运行依赖，下载 Camoufox 配套引擎与指纹模型，运行后端校验、TypeScript 检查和打包运行时的真实浏览器启动检查，然后构建 NSIS 安装包。构建或校验失败时不会发布 Release。
+打开仓库的 **Actions → Windows Release** 查看进度。流程在干净虚拟环境中安装固定版本依赖，下载 Camoufox 配套引擎和官方嵌入式 Python，分别生成浏览器核心、字体包和 Python 运行时包。后端校验、TypeScript 检查、运行时安装校验，以及 Windows/macOS/Linux 指纹的真实浏览器启动检查通过后，再构建 NSIS 安装包。构建或校验失败时不会发布 Release。
 
 成功后，其他人进入仓库的 **Releases**，选择版本，在 **Assets** 下载：
 
-- `Cacer_0.1.0_windows_x64-setup.exe`：Windows 64 位安装包，包含 Python、Python 依赖、指纹模型和浏览器引擎。
-- `SHA256SUMS.txt`：下载文件的 SHA256 校验值。
-- `runtime-dependencies.txt`：本次打包的 Python 依赖及版本。
+- `Cacer_版本_windows_x64-setup.exe`：Windows 64 位安装包，包含管理器、后端代码和浏览器核心，不包含字体和 Python。
+- `fonts.zip`：配套完整字体集，首次启动浏览器时从本版本 Release 下载，也可在设置中提前下载。
+- `python-runtime.zip`：精简的专用嵌入式 Python 和配套依赖，由用户选择快捷安装。
+- `runtime-manifest.json`：运行时版本、下载大小和 SHA256；安装包内含相同清单，下载时使用内置摘要验证。
+- `SHA256SUMS.txt`：全部下载附件的 SHA256 校验值。
+- `runtime-dependencies.txt`：该版本完整 Python 依赖锁定清单。
 
-安装使用无需单独安装 Python、Node.js 或 Rust。WebView2 缺失时安装器会联网安装；代理订阅功能仍需配置本机可用的 mihomo/Clash 内核。安装包未配置 Windows 代码签名。
+首次打开管理器无需 Python。运行环境未就绪时，用户可选择「快捷安装 Python 与依赖」，或展开「手动安装 Python / 使用已有 Python」，复制 PowerShell 命令创建独立虚拟环境，再指定其 `python.exe`。快捷安装不修改系统 PATH。安装界面提供进度、取消、重试及下载代理设置（HTTP 或 SOCKS5）。
+
+字体先以完整配套字体集下载，暂不按系统拆分，避免缺失跨系统指纹需要的字形。文件校验、解压完成后才启用，所有环境共享缓存；安装成功后删除下载 ZIP。管理器升级时，清单摘要相同的运行时可复用，首次使用全部功能的下载总量不会因分包自动减少。
+
+运行时缓存位于应用数据目录旁的 `runtime-cache`，与保存环境、登录信息的 `data` 目录分开，导出用户数据不包含运行时。开发构建没有发布清单时继续使用本地 `.venv` 和已下载引擎。手动 Actions 构建的附件可用于本地校验；其下载地址只有对应版本的 Release 发布后才可访问。
+
+WebView2 缺失时安装器会联网安装，无需 Node.js 或 Rust。代理订阅功能仍需配置本机可用的 mihomo/Clash 内核。安装包未配置 Windows 代码签名。
 
 只想验证构建时，可在 **Actions → Windows Release → Run workflow** 选择分支手动运行。产物保存在该次运行的 **Artifacts**，保留 14 天；手动运行不会创建 Release。
 
