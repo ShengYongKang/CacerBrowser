@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Cacer",
+  "mainBinaryName": "cacer-manager",
+  "version": "0.1.0",
+  "identifier": "org.shadowfox.manager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Cacer",
+        "width": 1240,
+        "height": 780,
+        "minWidth": 980,
+        "minHeight": 620,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "nsis",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": [
+      "resources/core",
+      "resources/runtime"
+    ]
+  }
+}
