@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ReactNode } from "react";
 
-export default function Modal(props: { title: string; onClose: () => void; children: ReactNode }) {
+export default function Modal(props: { title: string; onClose: () => void; closeDisabled?: boolean; children: ReactNode }) {
   const dialog = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const element = dialog.current!;
@@ -15,7 +15,7 @@ export default function Modal(props: { title: string; onClose: () => void; child
     <div className="modal"><div className="modal-scroll">
       <div className="modal-head">
         <h2>{props.title}</h2>
-        <button className="icon-button" onClick={props.onClose} aria-label="关闭">×</button>
+        <button className="icon-button" disabled={props.closeDisabled} onClick={props.onClose} aria-label="关闭">×</button>
       </div>
       {props.children}
     </div></div>
