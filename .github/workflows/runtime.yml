@@ -10,9 +10,19 @@ on:
         description: 'Runtime release tag (for example runtime-1)'
         required: true
         default: 'runtime-1'
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Runtime release tag from runtime-release.txt'
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: runtime-${{ inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -61,6 +71,6 @@ jobs:
           RUNTIME_TAG: ${{ inputs.tag }}
         run: |
           gh release view "$env:RUNTIME_TAG" *> $null
-          if ($LASTEXITCODE -eq 0) { throw "Runtime release $env:RUNTIME_TAG already exists; publish a new tag instead" }
+          if ($LASTEXITCODE -eq 0) { Write-Host "Runtime release $env:RUNTIME_TAG already exists; nothing to publish"; exit 0 }
           gh release create "$env:RUNTIME_TAG" build/runtime-assets/* --prerelease --title "Cacer runtime $env:RUNTIME_TAG" --notes 'Immutable runtime archives for Cacer. Publish a new tag instead of replacing assets.'
           if ($LASTEXITCODE -ne 0) { throw 'Runtime release publishing failed' }

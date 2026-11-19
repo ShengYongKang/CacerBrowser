@@ -14,7 +14,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  runtime_pin:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pin.outputs.tag }}
+      exists: ${{ steps.pin.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag=$(tr -d '[:space:]' < runtime-release.txt)
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  ensure_runtime:
+    needs: runtime_pin
+    if: needs.runtime_pin.outputs.exists == 'false'
+    uses: ./.github/workflows/runtime.yml
+    with:
+      tag: ${{ needs.runtime_pin.outputs.tag }}
+    permissions:
+      contents: write
+    secrets: inherit
+
   build:
+    needs: [runtime_pin, ensure_runtime]
+    # A skipped ensure_runtime means the pinned release already existed.
+    if: always() && needs.runtime_pin.result == 'success' && (needs.ensure_runtime.result == 'success' || needs.ensure_runtime.result == 'skipped')
     runs-on: windows-2022
     timeout-minutes: 90
     outputs:
