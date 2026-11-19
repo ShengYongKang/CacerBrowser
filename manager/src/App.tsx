@@ -10,6 +10,7 @@ import {
   proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, type EnvironmentCheck,
 } from "./api";
 import Flag from "./Flag";
+import Modal from "./Modal";
 
 const APP_ICON = new URL("../app-icon.png", import.meta.url).href;
 
@@ -59,27 +60,15 @@ function formatStamp(seconds: number): string {
 
 function emptyForm(): CreateRequest { return { name: "", note: "", os: "", country: "", network: "direct", ui_locale: "zh-CN", memory_cache: true }; }
 
-/// Notes written before the multiline input existed may contain escaped line
-/// breaks ("\n") or the "/n" users typed as a workaround; render both as
-/// real breaks so the bubble matches what was intended.
-function noteForTooltip(note: string): string {
-  return note.replace(/\\n|\/n/g, "\n");
-}
+
 
 /// The table row is a single line: strip any breaks so notes never introduce
 /// blank space or wrap oddly there.
 function inlineNote(note: string): string {
-  return noteForTooltip(note).replace(/\s*\n+\s*/g, " ").trim();
+  return note.replace(/\s*\n+\s*/g, " ").trim();
 }
 
-function Modal(props: { title: string; onClose: () => void; children: ReactNode }) {
-  return <div className="overlay" onClick={props.onClose}>
-    <div className="modal" onClick={(e) => e.stopPropagation()}>
-      <div className="modal-head"><div><div className="eyebrow">CACER</div><h2>{props.title}</h2></div><button className="icon-button" onClick={props.onClose} aria-label="关闭">×</button></div>
-      {props.children}
-    </div>
-  </div>;
-}
+
 
 function Icon({ children }: { children: ReactNode }) { return <span className="nav-icon">{children}</span>; }
 
@@ -127,7 +116,8 @@ export default function App() {
   const [showUpdate, setShowUpdate] = useState(false);
   const [updateState, setUpdateState] = useState<UpdateStatus | null>(null);
   const updateBusy = useRef(false);
-  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [appVersion, setAppVersion] = useState("…");
+  const [checkingEnvironment, setCheckingEnvironment] = useState(false);
   const [showProxy, setShowProxy] = useState(false);
   const [proxyStep, setProxyStep] = useState<"ask" | "input">("ask");
   const [proxyValue, setProxyValue] = useState("");
@@ -221,13 +211,15 @@ export default function App() {
     return refreshRequest.current;
   }
   async function checkEnvironment() {
+    setCheckingEnvironment(true);
     try {
       const result = await environmentCheck();
       environmentRef.current = result;
       setEnvironment(result);
       if (result.ready) { setError(null); await refresh(true); await loadExtensions(); }
       return result;
-    } catch (e) { setError(String(e)); return null; }
+    } catch (e) { setEnvironment(null); environmentRef.current = null; setError(String(e)); return null; }
+    finally { setCheckingEnvironment(false); }
   }
   /// Every mirror and the system proxy failed: first ask whether to configure
   /// one; the address is only requested after the user agrees.
@@ -616,7 +608,7 @@ export default function App() {
       x: Math.max(12, Math.min(rect.left, window.innerWidth - 380)),
       y: above ? rect.top : rect.bottom + 8,
       above,
-      text: noteForTooltip(note),
+      text: note,
     });
   }
   function hideNoteTip() {
@@ -664,7 +656,7 @@ export default function App() {
   };
   const exportCookiesCurrent = () => {
     if (!editTarget) return;
-    const file = window.prompt("导出 Cookie 文件路径", `${editTarget.name || editTarget.id}-cookies.json`);
+    const file = window.prompt("请输入 Cookie JSON 文件的保存路径。文件可能包含网站登录凭据，请保存在仅自己可访问的位置。", `${editTarget.name || editTarget.id}-cookies.json`);
     if (!file?.trim()) return;
     withBusy(`cookies-${editTarget.id}`, () => exportCookies(editTarget.id, file.trim()));
   };
@@ -785,7 +777,10 @@ export default function App() {
     <aside className="sidebar">
       <div className="brand"><img className="brand-mark" src={APP_ICON} alt="" /><div><strong>Cacer</strong><span>隐私浏览工作台</span></div></div>
       <nav className="nav"><div className="nav-group-title">工作台</div><a className={`nav-item ${view === "overview" ? "active" : ""}`} onClick={() => setView("overview")}><Icon>⌂</Icon>总览</a><a className={`nav-item ${view === "environments" ? "active" : ""}`} onClick={() => setView("environments")}><Icon>▦</Icon>浏览器环境<span className="nav-count">{identities.length}</span></a><a className={`nav-item ${view === "proxy" ? "active" : ""}`} onClick={() => setView("proxy")}><Icon>⌁</Icon>代理管理</a><a className={`nav-item ${view === "extensions" ? "active" : ""}`} onClick={() => setView("extensions")}><Icon>⧩</Icon>扩展中心<span className="nav-count">{extItems.length}</span></a><a className={`nav-item ${view === "history" ? "active" : ""}`} onClick={() => setView("history")}><Icon>◷</Icon>启动记录</a><div className="nav-group-title second">系统</div><a className={`nav-item ${view === "fonts" ? "active" : ""}`} onClick={() => setView("fonts")}><Icon>文</Icon>字体库</a><a className="nav-item" onClick={openSettings}><Icon>⚙</Icon>设置</a></nav>
-      <div className={`sidebar-bottom ${environment && !environment.ready ? "service-warning" : ""}`} onClick={checkEnvironment} title="点击重新检查运行环境"><div className="health-dot"/><div><strong>{environment ? (environment.ready ? "本地服务正常" : "需要检查环境") : "正在检查环境"}</strong><span>Cacer {appVersion} · 点击检测</span></div></div>
+      <button type="button" className={`sidebar-bottom ${environment && !environment.ready ? "service-warning" : ""}`} disabled={checkingEnvironment} onClick={checkEnvironment}
+        title={environment?.checks.map(item => `${item.label}：${item.ok ? "正常" : "待处理"}`).join("\n") || "检查本机运行环境"}>
+        <i className="health-dot"/><div><strong aria-live="polite">{checkingEnvironment ? "正在检测…" : environment?.ready ? "本地服务正常" : "需要检查环境"}</strong><span>Cacer {appVersion}{!checkingEnvironment && !environment?.ready && " · 点击检测"}</span></div>
+      </button>
     </aside>
     <section className="workspace">
       <header className="topbar"><div className="breadcrumb"><span>工作台</span><b>/</b><strong>{VIEW_LABEL[view]}</strong></div><div className="top-actions">{update?.available && <button className="icon-button update-button" title={`发现新版本 ${update.latest}`} onClick={() => setShowUpdate(true)}>⤓<i className="update-dot" /></button>}<button className="icon-button" title="刷新" onClick={() => refresh(true)}>↻</button><button className="icon-button" title="设置" onClick={openSettings}>⚙</button></div></header>
@@ -908,7 +903,7 @@ export default function App() {
       {downloadState.total > 0 && <><progress max={downloadState.total} value={downloadState.downloaded} /><span>{formatSize(downloadState.downloaded)} / {formatSize(downloadState.total)}</span></>}
     </div>}
 
-    {showCreate && <Modal title="新建浏览器环境" onClose={() => { if (!busyRef.current.has("create")) setShowCreate(false); }}><div className="form-intro">创建后将生成一套稳定、隔离的浏览器身份配置。</div>{error && <div className="form-error">{error}</div>}{busy.has("create") && <div className="form-progress">正在生成隔离指纹，请稍候，完成后自动关闭…</div>}<div className="grid"><label><span>环境名称 <em>*</em></span><input value={form.name} placeholder="例如：法国小店-A" onChange={(e) => setForm({ ...form, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={form.note} placeholder="例如：电商账号专用（支持换行）" onChange={(e) => setForm({ ...form, note: e.target.value })} /></label><label><span>设备系统</span><select value={form.os ?? ""} onChange={(e) => setForm({ ...form, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={form.country ?? ""} onChange={(e) => setForm({ ...form, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small className="field-hint">语言、时区与设备指纹将自动跟随国家。</small></label><label className="wide"><span>浏览器界面语言</span><select value={form.ui_locale ?? "zh-CN"} onChange={(e) => setForm({ ...form, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option></select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。选择「跟随环境语言」时，日期与数字格式也会与当地完全一致。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(form.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setForm({ ...form, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">开启后页面回访与前进/后退直接读内存缓存，不再重新下载，代理环境下明显更流畅；关闭则保持引擎默认的「仅磁盘缓存」。</small></label><label className="wide"><span>网络方式</span><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" key={value} className={netChoice === value ? "seg-on" : "seg-off"} onClick={() => setNetChoice(value)}>{label}</button>)}</div></label>
+    {showCreate && <Modal title="新建浏览器环境" onClose={() => { if (!busyRef.current.has("create")) setShowCreate(false); }}><div className="form-intro">创建后将生成一套稳定、隔离的浏览器身份配置。</div>{error && <div className="form-error">{error}</div>}{busy.has("create") && <div className="form-progress">正在生成隔离指纹，请稍候，完成后自动关闭…</div>}<div className="grid"><label><span>环境名称 <em>*</em></span><input value={form.name} placeholder="例如：法国小店-A" onChange={(e) => setForm({ ...form, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={form.note} placeholder="例如：电商账号专用（支持换行）" onChange={(e) => setForm({ ...form, note: e.target.value })} /></label><label><span>设备系统</span><select value={form.os ?? ""} onChange={(e) => setForm({ ...form, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={form.country ?? ""} onChange={(e) => setForm({ ...form, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small className="field-hint">语言、时区与设备指纹将自动跟随国家。</small></label><label className="wide"><span>浏览器界面语言</span><select value={form.ui_locale ?? "zh-CN"} onChange={(e) => setForm({ ...form, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option></select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。选择「跟随环境语言」时，日期与数字格式也会与当地完全一致。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(form.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setForm({ ...form, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">允许浏览器在内存中复用已缓存的资源，减少重复下载。</small></label><label className="wide"><span>网络方式</span><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" key={value} className={netChoice === value ? "seg-on" : "seg-off"} onClick={() => setNetChoice(value)}>{label}</button>)}</div></label>
       {netChoice === "sub" && <>
         <label className="wide"><span>代理订阅</span><select value={form.proxy_source ?? ""} onChange={(e) => chooseSubSource(e.target.value, false)}><option value="">选择订阅…</option>{proxySourceList.map((s) => <option key={s.name} value={s.name}>{s.label}（{s.nodes} 个节点）</option>)}</select>{!proxySourceList.length && <small className="field-hint">还没有订阅，请先在「代理管理」中导入。</small>}</label>
         <label className="wide"><span>节点</span><select value={form.proxy_node ?? ""} onChange={(e) => setForm({ ...form, proxy_node: e.target.value || null })} disabled={!form.proxy_source}><option value="">{form.proxy_source ? "选择节点…" : "请先选择订阅"}</option>{subNodes.map((n) => <option key={n.name} value={n.name}>{n.name}{n.type ? ` · ${n.type}` : ""}</option>)}</select></label>
@@ -916,6 +911,7 @@ export default function App() {
       {netChoice === "custom" && <label className="wide"><span>代理服务器</span><input value={form.proxy_server ?? ""} placeholder="127.0.0.1:8080（默认 HTTP）" onChange={(e) => setForm({ ...form, proxy_server: e.target.value })} /></label>}</div><div className="modal-footer"><button className="secondary" disabled={busy.has("create")} onClick={() => setShowCreate(false)}>取消</button><button className="primary" disabled={!valid || busy.has("create")} onClick={create}>{busy.has("create") ? "生成中…" : "生成环境"}</button></div></Modal>}
     {showSettings && <Modal title="设置" onClose={() => setShowSettings(false)}>
       {error && <div className="form-error">{error}</div>}
+      <details className="edit-section"><summary>关于 Cacer</summary><p>版本 {appVersion}</p><p>项目仓库：<a href="https://github.com/baseless1119/CacerBrowser" target="_blank" rel="noreferrer">github.com/baseless1119/CacerBrowser</a></p><p>Cacer 自定义软件许可 · 原创部分由著作权人保留全部权利。未经书面许可，禁止以商业目的重新打包或分发。第三方组件适用各自许可。</p></details>
       {runtimeControls}
       <section className="edit-section">{dataBlock}</section>
     </Modal>}
@@ -978,7 +974,7 @@ export default function App() {
         <button className="secondary" onClick={() => setFailedTask(null)}>关闭</button>
       </div>
     </Modal>}
-    {editTarget && <Modal title="编辑环境" onClose={() => setEditTarget(null)}><section className="edit-section"><h4>身份指纹</h4><div className="fpinfo"><span><Flag country={editTarget.country} size={16} /> {editTarget.country || "自动地区"}</span><span>{OS_ICONS[editTarget.os]} {OS_LABELS[editTarget.os] ?? editTarget.os}</span><span>◷ {editTarget.timezone}</span><span>文 {editTarget.languages?.[0] ?? editTarget.locale}</span></div><p className="hint">设备指纹保持不变，以维持 Cookie 和登录状态的一致性。</p></section><section className="edit-section"><h4>基本信息</h4><div className="grid"><label><span>环境名称</span><input value={editForm.name ?? ""} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={editForm.note ?? ""} onChange={(e) => setEditForm({ ...editForm, note: e.target.value })} /></label><label><span>设备系统</span><select value={editForm.os ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={editForm.country ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="wide"><span>浏览器界面语言</span><select value={editForm.ui_locale ?? ""} onChange={(e) => setEditForm({ ...editForm, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option>{editForm.ui_locale && editForm.ui_locale !== "zh-CN" && <option value={editForm.ui_locale}>当前：{editForm.ui_locale}</option>}</select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。修改后下次启动生效。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(editForm.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setEditForm({ ...editForm, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">开启后页面回访与前进/后退直接读内存缓存，代理环境下更流畅。修改后下次启动生效。</small></label></div></section><section className="edit-section"><h4>网络方式</h4><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" disabled={editLive} key={value} className={editNetChoice === value ? "seg-on" : "seg-off"} onClick={() => setEditNetChoice(value)}>{label}</button>)}</div>
+    {editTarget && <Modal title="编辑环境" onClose={() => setEditTarget(null)}><section className="edit-section"><h4>身份指纹</h4><div className="fpinfo"><span><Flag country={editTarget.country} size={16} /> {editTarget.country || "自动地区"}</span><span>{OS_ICONS[editTarget.os]} {OS_LABELS[editTarget.os] ?? editTarget.os}</span><span>◷ {editTarget.timezone}</span><span>文 {editTarget.languages?.[0] ?? editTarget.locale}</span></div><p className="hint">设备指纹保持不变，以维持 Cookie 和登录状态的一致性。</p></section><section className="edit-section"><h4>基本信息</h4><div className="grid"><label><span>环境名称</span><input value={editForm.name ?? ""} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={editForm.note ?? ""} onChange={(e) => setEditForm({ ...editForm, note: e.target.value })} /></label><label><span>设备系统</span><select value={editForm.os ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={editForm.country ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="wide"><span>浏览器界面语言</span><select value={editForm.ui_locale ?? ""} onChange={(e) => setEditForm({ ...editForm, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option>{editForm.ui_locale && editForm.ui_locale !== "zh-CN" && <option value={editForm.ui_locale}>当前：{editForm.ui_locale}</option>}</select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。修改后下次启动生效。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(editForm.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setEditForm({ ...editForm, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">允许浏览器在内存中复用已缓存的资源，减少重复下载。修改后下次启动生效。</small></label></div></section><section className="edit-section"><h4>网络方式</h4><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" disabled={editLive} key={value} className={editNetChoice === value ? "seg-on" : "seg-off"} onClick={() => setEditNetChoice(value)}>{label}</button>)}</div>
       {editNetChoice === "sub" && <div className="grid">
         <label><span>代理订阅</span><select value={editForm.proxy_source ?? ""} disabled={editLive} onChange={(e) => chooseSubSource(e.target.value, true)}><option value="">选择订阅…</option>{proxySourceList.map((s) => <option key={s.name} value={s.name}>{s.label}（{s.nodes} 个节点）</option>)}</select>{!proxySourceList.length && <small className="field-hint">还没有订阅，请先在「代理管理」中导入。</small>}</label>
         <label><span>节点</span><select value={editForm.proxy_node ?? ""} onChange={(e) => setEditForm({ ...editForm, proxy_node: e.target.value })} disabled={editLive || !editForm.proxy_source}><option value="">{editForm.proxy_source ? "选择节点…" : "请先选择订阅"}</option>{editSubNodes.map((n) => <option key={n.name} value={n.name}>{n.name}{n.type ? ` · ${n.type}` : ""}</option>)}</select></label>
