@@ -505,14 +505,14 @@ fn environment_check_sync() -> Result<Value, String> {
         }),
         serde_json::json!({
             "key": "dependencies",
-            "label": "运行依赖",
+            "label": "Python 依赖包",
             "ok": camoufox_import_ok,
             "detail": if camoufox_import_ok {
-                "camoufox、playwright 等依赖已就绪".to_string()
+                "该 Python 已安装 camoufox、playwright、fpgen、Pillow、PySocks".to_string()
             } else if python_ok {
-                "已检测到 Python，但缺少 camoufox / playwright 等依赖。可为其安装依赖，或使用「快捷安装」的独立运行时".to_string()
+                "当前 Python 缺少运行依赖。点「使用独立运行时」将下载并切换到内置依赖的独立 Python；也可在设置中手动配置已有 Python".to_string()
             } else {
-                "需要先检测到 Python 解释器".to_string()
+                "需要先安装或选择一个 Python 解释器".to_string()
             }
         }),
         serde_json::json!({
@@ -1115,10 +1115,10 @@ async fn launch_history(limit: usize) -> Result<Value, String> {
 
 // ------------------------------------------------------------ self update
 
-/// Async: the GitHub API (and its mirrors) is a network call.
+/// Keep the official GitHub API request off the async worker.
 #[tauri::command]
 async fn check_update() -> Result<update::UpdateInfo, String> {
-    tauri::async_runtime::spawn_blocking(update::check)
+    tauri::async_runtime::spawn_blocking(|| update::check(&project_root()))
         .await.map_err(|e| e.to_string())?
 }
 
@@ -1137,8 +1137,9 @@ fn cancel_update() { update::cancel(); }
 /// Start the downloaded installer (which keeps the directory page editable)
 /// and close the running app so the installer can replace its files.
 #[tauri::command]
-fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    update::install(&project_root())?;
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| update::install(&project_root()))
+        .await.map_err(|e| e.to_string())??;
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(400));
         app.exit(0);

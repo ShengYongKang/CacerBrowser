@@ -30,7 +30,10 @@
     "targets": "nsis",
     "windows": {
       "nsis": {
-        "template": "nsis/installer.nsi"
+        "template": "nsis/installer.nsi",
+        "languages": ["SimpChinese"],
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
       }
     },
     "icon": ["icons/icon.ico", "icons/icon.png"],

@@ -318,6 +318,7 @@ export interface UpdateInfo {
   name: string;
   url: string;
   size: number;
+  sha256: string;
   available: boolean;
 }
 

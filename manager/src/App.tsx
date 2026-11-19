@@ -4,10 +4,10 @@ import {
   ClashConfig, CreateRequest, DataOverview, EditRequest, ExtensionItem, ExtensionSearchResult, HistoryItem, Identity, ProxyNode, ProxySource,
   cancelRuntime, installRuntime, runtimeStatus, selectPython, type RuntimeStatus,
   checkUpdate, downloadUpdate, updateStatus, cancelUpdate, installUpdate, type UpdateInfo, type UpdateStatus,
-  downloadSettings, saveDownloadSettings, fontOverview, type FontOverview,
+  saveDownloadSettings, fontOverview, type FontOverview,
   clashConfigs, cloneIdentity, createIdentity, dataOverview, deleteIdentity, editIdentity, environmentCheck,
   exportAllData, exportCookies, exportPack, extImport, extInstall, extList, extRemove, extSearch, importAllData, importPack, launchHistory, launchIdentity, listIdentities, openDataDir,
-  proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, systemProxy, type EnvironmentCheck,
+  proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, type EnvironmentCheck,
 } from "./api";
 import Flag from "./Flag";
 
@@ -43,16 +43,6 @@ function formatUsers(count: number): string {
 
 /// Sentinel shared with the Rust downloaders: every mirror and GitHub failed.
 const DOWNLOAD_ROUTES_FAILED = "所有下载线路均失败";
-
-/// Windows reports proxies as "http=host:port;https=host:port"; turn that
-/// into a single URL the download settings accept.
-function proxyFromSystem(server: string): string {
-  const entries = server.split(";").map((entry) => entry.trim()).filter(Boolean);
-  const pick = entries.find((entry) => entry.startsWith("https=")) ?? entries.find((entry) => entry.startsWith("http="));
-  const value = (pick ? pick.slice(pick.indexOf("=") + 1) : server).trim();
-  if (!value) return "";
-  return value.includes("://") ? value : `http://${value}`;
-}
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -93,14 +83,24 @@ function Modal(props: { title: string; onClose: () => void; children: ReactNode 
 
 function Icon({ children }: { children: ReactNode }) { return <span className="nav-icon">{children}</span>; }
 
-/// Every environment check on its own line; passed checks turn green.
-function EnvChecks({ checks }: { checks: EnvironmentCheck["checks"] }) {
-  return <div className="env-checks">{checks.map((check) => (
-    <div className={`env-check ${check.ok ? "ok" : "bad"}`} key={check.key}>
+/// One card per environment check: green checkmark when installed, an install
+/// button on the right when a missing piece can be fixed from here.
+function EnvChecks(props: {
+  checks: EnvironmentCheck["checks"];
+  onInstall?: (kind: "python" | "engine") => void;
+  busy?: boolean;
+}) {
+  return <div className="env-checks">{props.checks.map((check) => {
+    const action = check.key === "python" || check.key === "dependencies" ? "python"
+      : check.key === "engine" ? "engine" : null;
+    const actionLabel = check.key === "python" ? "安装独立 Python" : check.key === "engine" ? "重新安装说明" : "使用独立运行时";
+    return <div className={`env-card ${check.ok ? "ok" : "bad"}`} key={check.key}>
       <span className="env-mark">{check.ok ? "✓" : "!"}</span>
-      <span className="env-text"><strong>{check.label}</strong>{check.detail ? `：${check.detail}` : ""}</span>
-    </div>
-  ))}</div>;
+      <div className="env-copy"><strong>{check.label}</strong><p>{check.detail}</p></div>
+      {!check.ok && action && props.onInstall
+        && <button className="secondary env-action" disabled={props.busy} onClick={() => props.onInstall?.(action)}>{actionLabel}</button>}
+    </div>;
+  })}</div>;
 }
 
 export default function App() {
@@ -120,7 +120,6 @@ export default function App() {
   const [editForm, setEditForm] = useState<EditRequest>({});
   const [netChoice, setNetChoice] = useState<"direct" | "sub" | "custom">("direct");
   const [editNetChoice, setEditNetChoice] = useState<"direct" | "sub" | "custom">("direct");
-  const [guide, setGuide] = useState<"python" | "engine" | "fonts" | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
   const runtimeBusyRef = useRef(false);
   const [downloadState, setDownloadState] = useState<RuntimeStatus | null>(null);
@@ -129,9 +128,10 @@ export default function App() {
   const [updateState, setUpdateState] = useState<UpdateStatus | null>(null);
   const updateBusy = useRef(false);
   const [appVersion, setAppVersion] = useState("0.1.0");
-  const [downloadProxy, setDownloadProxy] = useState("");
   const [showProxy, setShowProxy] = useState(false);
+  const [proxyStep, setProxyStep] = useState<"ask" | "input">("ask");
   const [proxyValue, setProxyValue] = useState("");
+  const [failedTask, setFailedTask] = useState<"python" | "fonts" | null>(null);
   const proxyRetry = useRef<((proxy: string) => void) | null>(null);
   const [fontPlan, setFontPlan] = useState<FontOverview | null>(null);
   const [fontCountry, setFontCountry] = useState("");
@@ -170,8 +170,6 @@ export default function App() {
 
   useEffect(() => {
     checkEnvironment();
-    downloadSettings().then((settings) => setDownloadProxy(settings.proxy))
-      .catch((e) => setError(String(e)));
     // Startup update probe: a failed check must never disturb the workflow.
     checkUpdate().then((info) => { if (info.available) setUpdate(info); }).catch(() => {});
     getVersion().then(setAppVersion).catch(() => {});
@@ -231,31 +229,30 @@ export default function App() {
       return result;
     } catch (e) { setError(String(e)); return null; }
   }
-  /// Every built-in mirror failed: ask for a proxy, prefilled with the system
-  /// one, and retry the failed download once it is saved.
-  async function offerProxy(retry: (proxy: string) => void) {
+  /// Every mirror and the system proxy failed: first ask whether to configure
+  /// one; the address is only requested after the user agrees.
+  function offerProxy(retry: (proxy: string) => void) {
     proxyRetry.current = retry;
-    let value = downloadProxy.trim();
-    if (!value) {
-      try {
-        const system = await systemProxy();
-        if (system.enabled) value = proxyFromSystem(system.server);
-      } catch { /* keep empty; the user can type one */ }
-    }
-    setProxyValue(value);
+    setProxyValue("");
+    setProxyStep("ask");
     setShowProxy(true);
   }
-  async function applyProxy() {
-    const proxy = proxyValue.trim();
-    if (!proxy) return;
+  async function applyProxy(clear = false) {
+    const proxy = clear ? "" : proxyValue.trim();
+    if (!clear && !proxy) return;
     try {
       await saveDownloadSettings({ proxy, mirror: "" });
-      setDownloadProxy(proxy);
       setShowProxy(false);
       setError(null);
       const retry = proxyRetry.current;
       proxyRetry.current = null;
       retry?.(proxy);
+    } catch (e) { setError(String(e)); }
+  }
+  async function clearDownloadProxy() {
+    try {
+      await saveDownloadSettings({ proxy: "", mirror: "" });
+      setNotice("已清除下载代理，后续下载将自动检测系统代理");
     } catch (e) { setError(String(e)); }
   }
   async function setupRuntime(kind: "python" | "fonts", fontIds: string[] = [], proxyOverride?: string): Promise<boolean> {
@@ -265,19 +262,26 @@ export default function App() {
     setError(null);
     setDownloadState({ busy: true, message: "正在准备", downloaded: 0, total: 0 });
     const timer = window.setInterval(() => runtimeStatus().then(setDownloadState).catch(() => {}), 500);
-    const proxy = proxyOverride ?? downloadProxy;
     try {
-      await saveDownloadSettings({ proxy, mirror: "" });
-      await installRuntime(kind, proxy, fontIds);
+      await installRuntime(kind, proxyOverride ?? "", fontIds);
       if (kind === "fonts") await loadFontPlan();
       await checkEnvironment();
       setNotice(kind === "python" ? "Python 与依赖已准备完成" : "浏览器字体已准备完成，后续可离线使用");
       return true;
     } catch (e) {
       const message = String(e);
-      if (message.includes(DOWNLOAD_ROUTES_FAILED)) {
+      if (message.includes("已取消")) {
+        setError(null);
+      } else if (!message.includes(DOWNLOAD_ROUTES_FAILED)) {
+        setError(message);
+      } else if (proxyOverride !== undefined) {
+        // A proxy was already supplied and still failed: stop looping and
+        // hand the user manual commands instead.
+        setCopied(false);
+        setFailedTask(kind);
+      } else {
         void offerProxy((retryProxy) => { void setupRuntime(kind, fontIds, retryProxy); });
-      } else setError(message);
+      }
       return false;
     }
     finally {
@@ -287,27 +291,23 @@ export default function App() {
       setDownloadState(null);
     }
   }
-  async function startUpdate() {
+  async function startUpdate(proxyRetried = false) {
     if (updateBusy.current || !update) return;
     updateBusy.current = true;
     setError(null);
     setUpdateState({ busy: true, message: "正在准备下载", downloaded: 0, total: update.size });
     const timer = window.setInterval(() => updateStatus().then(setUpdateState).catch(() => {}), 500);
-    let launched = false;
     try {
       await downloadUpdate();
       window.clearInterval(timer);
-      setUpdateState({ busy: false, message: "下载完成，正在启动安装程序…", downloaded: update.size, total: update.size });
-      launched = true;
+      setUpdateState({ busy: true, message: "下载完成，正在验证并启动安装程序…", downloaded: update.size, total: update.size });
       await installUpdate();
       setNotice("安装程序已启动，Cacer 即将退出完成更新");
     } catch (e) {
-      // Once the installer starts the window closes, so the call may reject
-      // without meaning the update failed.
       const message = String(e);
-      if (launched) return;
       if (message.includes(DOWNLOAD_ROUTES_FAILED)) {
-        void offerProxy(() => { void startUpdate(); });
+        if (proxyRetried) setError("重试后仍无法下载更新包，请检查网络或稍后重试。");
+        else void offerProxy(() => { void startUpdate(true); });
       } else setError(message);
     } finally {
       window.clearInterval(timer);
@@ -333,12 +333,6 @@ export default function App() {
       await launchIdentity(id); setPendingLaunch(null); setView("environments");
     }
   }
-  async function saveDownloadOptions() {
-    try {
-      await saveDownloadSettings({ proxy: downloadProxy, mirror: "" });
-      setNotice("下载设置已保存");
-    } catch (e) { setError(String(e)); }
-  }
   async function applyPython() {
     if (runtimeBusyRef.current) return;
     runtimeBusyRef.current = true;
@@ -348,7 +342,7 @@ export default function App() {
     finally { runtimeBusyRef.current = false; setRuntimeBusy(false); }
   }
   async function launchPrepared(id: string) {
-    if (!environmentRef.current?.ready) { setGuide("python"); return; }
+    if (!environmentRef.current?.ready) { setError("运行环境未就绪，请先安装 Python 依赖。"); return; }
     const plan = await fontOverview(id);
     if (!plan.ready) {
       setFontIdentity(id); setFontCountry(""); setFontPlan(plan);
@@ -359,12 +353,14 @@ export default function App() {
     }
     await launchIdentity(id);
   }
-  const failedKeys = environment?.checks.filter((check) => !check.ok).map((check) => check.key) ?? [];
-  const pythonMissing = failedKeys.includes("python");
-  const depsMissing = failedKeys.includes("dependencies");
-  const engineMissing = failedKeys.includes("engine");
   const guideText = environment?.manual_commands ?? "正在读取安装命令…";
-  function openGuide(kind: "python" | "engine" | "fonts") { setCopied(false); setGuide(kind); }
+  function installFromCard(kind: "python" | "engine") {
+    if (kind === "engine") {
+      setError("浏览器引擎随安装包提供，若文件缺失请重新安装当前版本。");
+      return;
+    }
+    void setupRuntime("python");
+  }
   async function copyGuide() {
     try {
       await navigator.clipboard.writeText(guideText);
@@ -767,18 +763,15 @@ export default function App() {
 
   const runtimeControls = <section className="edit-section">
     <h4>运行环境</h4>
-    <p className="hint">Python 可快捷安装或手动配置。字体按环境语言、界面语言及实际字体需求下载，所有环境共享缓存。</p>
-    {environment && <EnvChecks checks={environment.checks} />}
-    <p className="hint">下载会依次尝试多个公开的 GitHub 镜像，全部不可用时再提示配置代理；镜像文件仍须通过内置 SHA256 校验。</p>
-    <label className="edit-field"><span>指定下载代理（留空自动检测系统代理）</span><input value={downloadProxy} onChange={(e) => setDownloadProxy(e.target.value)} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" disabled={runtimeBusy} /></label>
-    <p className="field-hint">代理只用于下载安装资源，不修改环境的浏览代理。</p>
-    <button className="secondary" onClick={saveDownloadOptions} disabled={runtimeBusy}>保存下载设置</button>
+    <p className="hint">快捷安装会下载并切换到独立 Python（已包含运行依赖）；已有 Python 可在下方手动配置。字体按需下载，所有环境共享缓存。</p>
+    {environment && <EnvChecks checks={environment.checks} onInstall={installFromCard} busy={runtimeBusy} />}
+    <p className="hint">下载会依次尝试多个公开的 GitHub 镜像，再尝试系统代理；全部失败才会询问是否手动设置代理。镜像文件仍须通过内置 SHA256 校验。</p>
     <div className="settings-actions">
       <button className="primary" disabled={runtimeBusy} onClick={() => setupRuntime("python")}>快捷安装 Python 与依赖{environment?.python_size ? `（${formatSize(environment.python_size)}）` : ""}</button>
-      <button className="secondary" onClick={() => { setShowSettings(false); setGuide(null); setView("fonts"); }}>管理字体库</button>
+      <button className="secondary" onClick={() => { setShowSettings(false); setView("fonts"); }}>管理字体库</button>
       <button className="secondary" disabled={runtimeBusy} onClick={checkEnvironment}>重新检查</button>
+      <button className="secondary" disabled={runtimeBusy || !!updateState?.busy} onClick={clearDownloadProxy}>清除下载代理，恢复自动检测</button>
     </div>
-    {downloadState && <div className="form-progress" role="status">{downloadState.message}{downloadState.total > 0 && <> · {formatSize(downloadState.downloaded)} / {formatSize(downloadState.total)}<progress max={downloadState.total} value={downloadState.downloaded} /></>}<button className="secondary" onClick={() => cancelRuntime().catch((e) => setError(String(e)))}>取消</button></div>}
     <details><summary>手动安装 Python / 使用已有 Python</summary>
       <p className="hint">将以下命令复制到 PowerShell 执行。已有 Python 时可以跳过安装步骤，再填入已安装依赖的解释器路径。</p>
       <pre className="cmd-block">{guideText}</pre>
@@ -797,7 +790,7 @@ export default function App() {
     <section className="workspace">
       <header className="topbar"><div className="breadcrumb"><span>工作台</span><b>/</b><strong>{VIEW_LABEL[view]}</strong></div><div className="top-actions">{update?.available && <button className="icon-button update-button" title={`发现新版本 ${update.latest}`} onClick={() => setShowUpdate(true)}>⤓<i className="update-dot" /></button>}<button className="icon-button" title="刷新" onClick={() => refresh(true)}>↻</button><button className="icon-button" title="设置" onClick={openSettings}>⚙</button></div></header>
       <div className="content">
-        {environment && !environment.ready && <div className="banner warning"><span>!</span><div><strong>运行环境未就绪</strong><EnvChecks checks={environment.checks} /></div><div className="banner-actions">{pythonMissing && <button onClick={() => openGuide("python")}>安装 Python</button>}{depsMissing && <button onClick={() => openGuide("python")}>安装运行依赖</button>}{engineMissing && <button onClick={() => openGuide("engine")}>安装 Camoufox 引擎</button>}<button onClick={checkEnvironment}>重新检查</button></div></div>}
+        {environment && !environment.ready && <div className="banner warning env-banner"><div className="env-banner-body"><div className="env-banner-head"><strong>运行环境未就绪</strong><button className="env-recheck" onClick={checkEnvironment} disabled={runtimeBusy}>重新检查</button></div><EnvChecks checks={environment.checks} onInstall={installFromCard} busy={runtimeBusy} /></div></div>}
         {error && <div className="banner error"><span>!</span><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
         {notice && <div className="banner success"><span>✓</span><span>{notice}</span></div>}
         {view === "fonts" && <>
@@ -909,6 +902,12 @@ export default function App() {
       </div>
     </section>
 
+    {runtimeBusy && downloadState && <div className="download-toast" role="status">
+      <div className="download-toast-head"><strong>正在准备运行资源</strong><button className="icon-button" title="取消下载" onClick={() => cancelRuntime().catch((e) => setError(String(e)))}>×</button></div>
+      <p>{downloadState.message}</p>
+      {downloadState.total > 0 && <><progress max={downloadState.total} value={downloadState.downloaded} /><span>{formatSize(downloadState.downloaded)} / {formatSize(downloadState.total)}</span></>}
+    </div>}
+
     {showCreate && <Modal title="新建浏览器环境" onClose={() => { if (!busyRef.current.has("create")) setShowCreate(false); }}><div className="form-intro">创建后将生成一套稳定、隔离的浏览器身份配置。</div>{error && <div className="form-error">{error}</div>}{busy.has("create") && <div className="form-progress">正在生成隔离指纹，请稍候，完成后自动关闭…</div>}<div className="grid"><label><span>环境名称 <em>*</em></span><input value={form.name} placeholder="例如：法国小店-A" onChange={(e) => setForm({ ...form, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={form.note} placeholder="例如：电商账号专用（支持换行）" onChange={(e) => setForm({ ...form, note: e.target.value })} /></label><label><span>设备系统</span><select value={form.os ?? ""} onChange={(e) => setForm({ ...form, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={form.country ?? ""} onChange={(e) => setForm({ ...form, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small className="field-hint">语言、时区与设备指纹将自动跟随国家。</small></label><label className="wide"><span>浏览器界面语言</span><select value={form.ui_locale ?? "zh-CN"} onChange={(e) => setForm({ ...form, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option></select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。选择「跟随环境语言」时，日期与数字格式也会与当地完全一致。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(form.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setForm({ ...form, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">开启后页面回访与前进/后退直接读内存缓存，不再重新下载，代理环境下明显更流畅；关闭则保持引擎默认的「仅磁盘缓存」。</small></label><label className="wide"><span>网络方式</span><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" key={value} className={netChoice === value ? "seg-on" : "seg-off"} onClick={() => setNetChoice(value)}>{label}</button>)}</div></label>
       {netChoice === "sub" && <>
         <label className="wide"><span>代理订阅</span><select value={form.proxy_source ?? ""} onChange={(e) => chooseSubSource(e.target.value, false)}><option value="">选择订阅…</option>{proxySourceList.map((s) => <option key={s.name} value={s.name}>{s.label}（{s.nodes} 个节点）</option>)}</select>{!proxySourceList.length && <small className="field-hint">还没有订阅，请先在「代理管理」中导入。</small>}</label>
@@ -925,25 +924,31 @@ export default function App() {
       <section className="edit-section">
         <div className="update-versions"><span>当前版本 <strong>{update.current}</strong></span><span>最新版本 <strong>{update.latest}</strong></span><span>安装包 {formatSize(update.size)}</span></div>
         {update.notes && <pre className="update-notes">{update.notes}</pre>}
-        <p className="hint">下载会自动尝试多个中国大陆可用的 GitHub 镜像，任一线路成功即开始安装。安装向导中可修改安装目录，现有环境、订阅与设置都会保留。</p>
+        <p className="hint">下载会自动尝试多个 GitHub 镜像，通过校验后启动安装。安装向导中可修改安装目录，现有环境、订阅与设置都会保留。</p>
         {updateState && <div className="form-progress" role="status">{updateState.message}{updateState.total > 0 && <> · {formatSize(updateState.downloaded)} / {formatSize(updateState.total)}<progress max={updateState.total} value={updateState.downloaded} /></>}</div>}
       </section>
       <div className="modal-footer">
         {updateState?.busy
           ? <button className="secondary" onClick={() => cancelUpdate().catch((e) => setError(String(e)))}>取消下载</button>
-          : <><button className="secondary" onClick={() => setShowUpdate(false)}>稍后</button><button className="primary" onClick={startUpdate}>下载并安装</button></>}
+          : <><button className="secondary" onClick={() => setShowUpdate(false)}>稍后</button><button className="primary" onClick={() => startUpdate()}>下载并安装</button></>}
       </div>
     </Modal>}
     {showProxy && <Modal title="下载线路不可用" onClose={() => setShowProxy(false)}>
       {error && <div className="form-error">{error}</div>}
       <section className="edit-section">
-        <p className="hint">已依次尝试所有内置 GitHub 镜像，仍无法下载。请填写一个可用的 HTTP / SOCKS5 代理后重试；下方已自动填入系统代理。</p>
-        <label className="edit-field"><span>下载代理</span><input value={proxyValue} onChange={(e) => setProxyValue(e.target.value)} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
-        <p className="field-hint">代理只用于下载安装资源，不修改环境的浏览代理。</p>
+        {proxyStep === "ask"
+          ? <p className="hint">已依次尝试所有内置 GitHub 镜像和系统代理，仍无法下载。是否设置一个代理后重试？</p>
+          : <>
+            <p className="hint">请填写可用的 HTTP / SOCKS5 代理地址，保存后会立即重试下载。</p>
+            <label className="edit-field"><span>下载代理</span><input autoFocus value={proxyValue} onChange={(e) => setProxyValue(e.target.value)} placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" /></label>
+          </>}
       </section>
       <div className="modal-footer">
-        <button className="secondary" onClick={() => setShowProxy(false)}>取消</button>
-        <button className="primary" disabled={!proxyValue.trim()} onClick={applyProxy}>保存并重试</button>
+        <button className="secondary" onClick={() => { proxyRetry.current = null; setShowProxy(false); }}>取消</button>
+        <button className="secondary" onClick={() => applyProxy(true)}>清除代理并自动重试</button>
+        {proxyStep === "ask"
+          ? <button className="primary" onClick={() => setProxyStep("input")}>设置代理</button>
+          : <button className="primary" disabled={!proxyValue.trim()} onClick={() => applyProxy()}>保存并重试</button>}
       </div>
     </Modal>}
     {showClash && <Modal title="扫描到的 Clash 配置" onClose={() => setShowClash(false)}>
@@ -961,11 +966,17 @@ export default function App() {
         </>}
       <div className="modal-footer"><button className="secondary" onClick={() => setShowClash(false)} disabled={!!subBusy}>关闭</button><button className="primary" onClick={importAllClash} disabled={!!subBusy || localClashConfigs.length === 0}>全部导入</button></div>
     </Modal>}
-    {guide && <Modal title={guide === "fonts" ? "准备浏览器字体" : "运行环境设置"} onClose={() => { if (!runtimeBusy) setGuide(null); }}>
-      {error && <div className="form-error">{error}</div>}
-      {guide === "engine" && <p className="hint">安装包已包含浏览器核心。若文件缺失，请重新安装当前版本。</p>}
-      {runtimeControls}
-      <div className="modal-footer"><button className="secondary" disabled={runtimeBusy} onClick={() => setGuide(null)}>关闭</button></div>
+    {failedTask && <Modal title="下载失败" onClose={() => setFailedTask(null)}>
+      <section className="edit-section">
+        {failedTask === "python" ? <>
+          <p className="hint">重试后仍无法下载运行环境。可在 PowerShell 中手动执行以下命令安装，完成后回到主界面点「重新检查」。</p>
+          <pre className="cmd-block">{guideText}</pre>
+        </> : <p className="hint">字体下载失败，请检查网络后在「字体库」页面重新尝试。</p>}
+      </section>
+      <div className="modal-footer">
+        {failedTask === "python" && <button className="secondary" onClick={copyGuide}>{copied ? "已复制" : "复制安装命令"}</button>}
+        <button className="secondary" onClick={() => setFailedTask(null)}>关闭</button>
+      </div>
     </Modal>}
     {editTarget && <Modal title="编辑环境" onClose={() => setEditTarget(null)}><section className="edit-section"><h4>身份指纹</h4><div className="fpinfo"><span><Flag country={editTarget.country} size={16} /> {editTarget.country || "自动地区"}</span><span>{OS_ICONS[editTarget.os]} {OS_LABELS[editTarget.os] ?? editTarget.os}</span><span>◷ {editTarget.timezone}</span><span>文 {editTarget.languages?.[0] ?? editTarget.locale}</span></div><p className="hint">设备指纹保持不变，以维持 Cookie 和登录状态的一致性。</p></section><section className="edit-section"><h4>基本信息</h4><div className="grid"><label><span>环境名称</span><input value={editForm.name ?? ""} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></label><label><span>备注</span><textarea rows={3} value={editForm.note ?? ""} onChange={(e) => setEditForm({ ...editForm, note: e.target.value })} /></label><label><span>设备系统</span><select value={editForm.os ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, os: e.target.value || null })}>{OS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select></label><label><span>国家 / 地区</span><select value={editForm.country ?? ""} disabled={editLive} onChange={(e) => setEditForm({ ...editForm, country: e.target.value || null })}>{COUNTRY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label className="wide"><span>浏览器界面语言</span><select value={editForm.ui_locale ?? ""} onChange={(e) => setEditForm({ ...editForm, ui_locale: e.target.value })}><option value="zh-CN">中文（菜单显示中文）</option><option value="">跟随环境语言（一致性最高）</option>{editForm.ui_locale && editForm.ui_locale !== "zh-CN" && <option value={editForm.ui_locale}>当前：{editForm.ui_locale}</option>}</select><small className="field-hint">仅影响浏览器菜单与对话框的显示，不会改变网站识别到的语言和地区。修改后下次启动生效。</small></label><label className="wide"><span>内存缓存</span><div className="seg">{([["on", "开启（推荐）"], ["off", "关闭"]] as const).map(([value, label]) => <button type="button" key={value} className={(editForm.memory_cache === false) === (value === "off") ? "seg-on" : "seg-off"} onClick={() => setEditForm({ ...editForm, memory_cache: value === "on" })}>{label}</button>)}</div><small className="field-hint">开启后页面回访与前进/后退直接读内存缓存，代理环境下更流畅。修改后下次启动生效。</small></label></div></section><section className="edit-section"><h4>网络方式</h4><div className="seg">{([["direct", "直连"], ["sub", "订阅节点"], ["custom", "手动代理"]] as const).map(([value, label]) => <button type="button" disabled={editLive} key={value} className={editNetChoice === value ? "seg-on" : "seg-off"} onClick={() => setEditNetChoice(value)}>{label}</button>)}</div>
       {editNetChoice === "sub" && <div className="grid">

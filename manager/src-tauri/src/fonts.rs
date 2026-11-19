@@ -189,7 +189,7 @@ mod tests {
             fs::copy(&archive, downloads.join(format!("{hash}.zip"))).unwrap();
             packs.push(json!({"id": id, "name": id, "count": 1, "sha256": hash,
                 "size": bytes.len(), "unpacked_size": 4,
-                "url": format!("https://github.com/ShengYongKang/CacerBrowser/releases/download/v0.0.0/fonts-{id}.zip")}));
+                "url": format!("https://github.com/baseless1119/CacerBrowser/releases/download/v0.0.0/fonts-{id}.zip")}));
         }
         let manifest = json!({"schema": 2, "engine_id": "b".repeat(64), "python_version": "3.14",
             "python": {"sha256": "a".repeat(64), "size": 1, "unpacked_size": 1, "url": ""},

@@ -82,25 +82,23 @@ jobs:
         working-directory: manager
         run: npm ci --include=dev
 
-      - name: Prepare separate Python and font assets
+      - name: Fetch browser engine and assemble runtime resources
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
           python -m venv build/runtime-env
           if ($LASTEXITCODE -ne 0) { throw 'Runtime venv creation failed' }
           $runtimePython = './build/runtime-env/Scripts/python.exe'
-          & $runtimePython -m pip install -r requirements-runtime.txt fonttools==4.60.1
+          & $runtimePython -m pip install -r requirements-runtime.txt
           if ($LASTEXITCODE -ne 0) { throw 'Python dependencies failed' }
           & $runtimePython -m camoufox fetch
           if ($LASTEXITCODE -ne 0) { throw 'Browser download failed' }
           $engine = & $runtimePython -c "from camoufox.pkgman import camoufox_path; print(camoufox_path(download_if_missing=False))"
           if ($LASTEXITCODE -ne 0) { throw 'Browser runtime not found' }
-          Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.14.7/python-3.14.7-embed-amd64.zip' -OutFile build/python-embed.zip
-          $base = "https://github.com/$($env:RELEASE_REPOSITORY)/releases/download/v$($env:RELEASE_VERSION)"
-          & $runtimePython tools/prepare_release.py --engine $engine --python-embed build/python-embed.zip --release-base $base
-          if ($LASTEXITCODE -ne 0) { throw 'Runtime asset packaging failed' }
+          $tag = (Get-Content runtime-release.txt -Raw).Trim()
+          if (-not $tag) { throw 'runtime-release.txt is empty' }
+          python tools/prepare_app_release.py --tag $tag --engine $engine --assets build/runtime-assets
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime resource assembly failed' }
 
       - name: Check backend and frontend
         run: |
@@ -111,14 +109,18 @@ jobs:
           npm --prefix manager exec -- tsc --noEmit --project manager/tsconfig.json
           if ($LASTEXITCODE -ne 0) { throw 'TypeScript checks failed' }
 
-      - name: Smoke test separate runtime assets
-        env:
-          LOCALAPPDATA: ${{ runner.temp }}\cacer-smoke-user
+      - name: Check runtime manifest and installer
         run: |
-          python tools/smoke_release.py --resources manager/src-tauri/resources --assets build/release-assets
-          if ($LASTEXITCODE -ne 0) { throw 'Packaged browser smoke check failed' }
+          $tag = (Get-Content runtime-release.txt -Raw).Trim()
+          python tools/check_runtime_manifest.py --tag $tag
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime manifest check failed' }
           cargo test --manifest-path manager/src-tauri/Cargo.toml --lib -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Runtime installer checks failed' }
+
+      - name: Smoke test current app with fixed runtime assets
+        run: |
+          python tools/smoke_release.py --resources manager/src-tauri/resources --assets build/runtime-assets
+          if ($LASTEXITCODE -ne 0) { throw 'Current app and fixed runtime smoke check failed' }
 
       - name: Build Windows x64 installer
         working-directory: manager
@@ -129,7 +131,6 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           New-Item -ItemType Directory -Force release-assets | Out-Null
-          Copy-Item build/release-assets/* release-assets/
           $installers = @(Get-ChildItem manager/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe)
           if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer' }
           $name = "Cacer_$($env:RELEASE_VERSION)_windows_x64-setup.exe"

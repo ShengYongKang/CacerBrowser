@@ -200,7 +200,8 @@ pub(crate) fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> R
     }
     if !proxy.trim().is_empty() {
         routes.push((asset.url.clone(), proxy, false, "指定代理".into()));
-    } else if let Some(system) = system {
+    }
+    if let Some(system) = system {
         routes.push((asset.url.clone(), system, false, "系统代理".into()));
     }
     routes.push((asset.url.clone(), String::new(), false, "系统 / 环境代理".into()));
@@ -223,7 +224,7 @@ pub(crate) fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> R
 fn download_attempt(root: &Path, asset: &Asset, request_url: &str, proxy: &str, direct: bool, name: &str) -> Result<PathBuf, String> {
     let url = reqwest::Url::parse(&asset.url).map_err(|e| e.to_string())?;
     if url.scheme() != "https" || url.host_str() != Some("github.com")
-        || !url.path().starts_with("/ShengYongKang/CacerBrowser/releases/download/") {
+        || !url.path().starts_with("/baseless1119/CacerBrowser/releases/download/") {
         return Err("运行时下载地址不属于项目 Release".into());
     }
     let downloads = cache(root).join("downloads");
@@ -431,7 +432,7 @@ mod tests {
         let hash = operation(|| digest_file(&zip)).unwrap();
         let asset = serde_json::json!({
             "sha256": hash, "size": fs::metadata(&zip).unwrap().len(), "unpacked_size": 4,
-            "url": "https://github.com/ShengYongKang/CacerBrowser/releases/download/v0.0.0/fonts.zip"
+            "url": "https://github.com/baseless1119/CacerBrowser/releases/download/v0.0.0/fonts.zip"
         });
         let manifest = serde_json::json!({"schema": 1, "engine_id": "a".repeat(64),
             "python_version": "3.14", "python": asset, "fonts": asset});
@@ -473,13 +474,16 @@ mod tests {
         let settings = DownloadSettings { proxy: "socks5://127.0.0.1:1080".into(), mirror: "https://example.com/cache".into() };
         save_download_settings(&dir.0, &settings).unwrap();
         assert_eq!(download_settings(&dir.0).mirror, settings.mirror);
+        save_download_settings(&dir.0, &DownloadSettings::default()).unwrap();
+        assert!(download_settings(&dir.0).proxy.is_empty());
+        assert!(download_settings(&dir.0).mirror.is_empty());
     }
     #[test]
     fn mirror_responses_still_require_the_original_digest() {
         use std::net::TcpListener;
         let dir = TestDir::new();
         let asset = Asset { sha256: format!("{:x}", Sha256::digest(b"good")), size: 4, unpacked_size: 4,
-            url: "https://github.com/ShengYongKang/CacerBrowser/releases/download/v0.0.0/fonts.zip".into() };
+            url: "https://github.com/baseless1119/CacerBrowser/releases/download/v0.0.0/fonts.zip".into() };
         for (body, accepted) in [(b"good", true), (b"evil", false)] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());

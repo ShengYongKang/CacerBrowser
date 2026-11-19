@@ -13,10 +13,16 @@ from pathlib import Path
 def verify(resources: Path, assets: Path) -> None:
     resources, assets = resources.resolve(), assets.resolve()
     manifest = json.loads((resources / "runtime/manifest.json").read_text(encoding="utf-8"))
+    try:
+        from tools.prepare_release import tree_id
+    except ModuleNotFoundError:
+        from prepare_release import tree_id
     assert manifest["schema"] == 2
+    assert tree_id(resources / "runtime/camoufox") == manifest["engine_id"], "Browser engine differs from the runtime pin"
     assert not (resources / "runtime/python/python.exe").exists()
     assert not (resources / "runtime/camoufox/fonts").exists()
     assert json.loads((assets / "font-index.json").read_text(encoding="utf-8")) == manifest["font_index"]
+    print("Verifying runtime archive hashes and font coverage...", flush=True)
     seen = set()
     for asset in [manifest["python"], *manifest["font_packs"]]:
         path = assets / asset["file"]
@@ -36,6 +42,7 @@ def verify(resources: Path, assets: Path) -> None:
         root = Path(temporary)
         python = root / "python"
         engine = root / "engine"
+        print("Copying the browser and extracting embedded Python...", flush=True)
         shutil.copytree(resources / "runtime/camoufox", engine)
         with zipfile.ZipFile(assets / manifest["python"]["file"]) as archive:
             archive.extractall(python)
@@ -48,7 +55,7 @@ def verify(resources: Path, assets: Path) -> None:
         def cli(*arguments):
             process = subprocess.run([str(interpreter), str(resources / "core/bootstrap.py"),
                                       "--profiles", str(profiles), *arguments],
-                                     env=env, cwd=root, capture_output=True, text=True, timeout=180)
+                                     env=env, cwd=root, capture_output=True, text=True, encoding="utf-8", timeout=180)
             assert process.returncode == 0, process.stdout + process.stderr
             return json.loads(process.stdout)
 
@@ -58,6 +65,7 @@ def verify(resources: Path, assets: Path) -> None:
         cases = [("windows", "US"), ("macos", "JP"), ("linux", "IN"),
                  ("windows", "CN"), ("macos", "TW"), ("linux", "KR")]
         for target_os, country in cases:
+            print(f"Launching language smoke case: {target_os} / {country}", flush=True)
             source = """
 import json, os, sys, shutil, zipfile
 from pathlib import Path
@@ -68,7 +76,7 @@ from camoufox.sync_api import Camoufox
 root = Path(os.environ['CACER_TEST_ROOT'])
 engine = Path(os.environ['CACER_ENGINE_DIR'])
 assets = Path(os.environ['CACER_TEST_ASSETS'])
-manifest = json.loads((Path(os.environ['CACER_TEST_RESOURCES']) / 'runtime/manifest.json').read_text())
+manifest = json.loads((Path(os.environ['CACER_TEST_RESOURCES']) / 'runtime/manifest.json').read_text(encoding='utf-8'))
 index = manifest['font_index']
 identity = create_identity(name='Release check', os=sys.argv[1], country=sys.argv[2], max_draws=80)
 selected = {'base'}
